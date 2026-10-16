@@ -1,0 +1,28 @@
+# license: modifies FCEUmm (https://github.com/libretro/libretro-fceumm), GPL-2.0 (Copying); this patch is distributed under the same license.
+diff --git forkSrcPrefix/Makefile.libretro forkDstPrefix/Makefile.libretro
+index 5b90d40..30ca5f0 100644
+--- forkSrcPrefix/Makefile.libretro
++++ forkDstPrefix/Makefile.libretro
+@@ -460,6 +460,22 @@ else ifeq ($(platform), miyoo)
+ 	SHARED := -shared -Wl,--version-script=src/drivers/libretro/link.T -Wl,-no-undefined
+ 	PLATFORM_DEFINES += -fomit-frame-pointer -ffast-math -mcpu=arm926ej-s
+ 
++# TRIMUI SMART PRO
++else ifeq ($(platform), tg5040)
++	TARGET := $(TARGET_NAME)_libretro.so
++	CC = $(CROSS_COMPILE)gcc
++	CXX = $(CROSS_COMPILE)g++
++	AR = $(CROSS_COMPILE)ar
++	SHARED := -shared -Wl,--version-script=src/drivers/libretro/link.T -Wl,-no-undefined
++	LDFLAGS += -fPIC -flto
++	CFLAGS += -mtune=cortex-a53 -mcpu=cortex-a53 -march=armv8-a
++	CFLAGS += -fomit-frame-pointer -ffast-math -fPIC -flto
++	OPTIMIZE := -Ofast -DNDEBUG
++	HAVE_NTSC = 0
++	ifeq (,$(DEBUG))
++		# LDFLAGS += -s
++	endif
++	
+ # Windows MSVC 2017 all architectures
+ else ifneq (,$(findstring windows_msvc2017,$(platform)))
+ 	CC  = cl.exe

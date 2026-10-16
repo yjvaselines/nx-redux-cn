@@ -1,0 +1,337 @@
+#include "window.h"
+
+#include <cstdint>
+#include <iostream>
+
+#include "config.h"
+#include "def.h"
+#include "resourceManager.h"
+#include "screen.h"
+#include "sdlutils.h"
+
+#define KEYHOLD_TIMER_FIRST   12
+#define KEYHOLD_TIMER         3
+
+CWindow::CWindow(void):
+    m_timer(0),
+    m_lastPressed(SDLK_0),
+    m_retVal(0)
+{
+    // Add window to the lists for render
+    Globals::g_windows.push_back(this);
+}
+
+CWindow::~CWindow(void)
+{
+    // Remove last window
+    Globals::g_windows.pop_back();
+}
+
+namespace
+{
+
+std::uint32_t frameDeadline = 0;
+
+// Directions currently held on the joystick. SDL's keyboard state never sees
+// hat or axis input, so tick() consults these as well.
+SDLC_Keycode joyHatHeld = 0;
+SDLC_Keycode joyAxisHeld[2] = {0, 0}; // index 0 = left stick X, 1 = left stick Y
+int joyAxisDir[2] = {0, 0};           // -1, 0, +1 after deadzone/hysteresis
+constexpr int kAxisPressThreshold = 0x4000;   // matches the main UI's AXIS_DEADZONE
+constexpr int kAxisReleaseThreshold = 0x2000; // hysteresis so a stick resting near the edge does not chatter
+
+// Limit FPS to avoid high CPU load, use when v-sync isn't available
+void LimitFrameRate()
+{
+    const int refreshDelay = 1000000 / screen.refreshRate;
+    std::uint32_t tc = SDL_GetTicks() * 1000;
+    std::uint32_t v = 0;
+    if (frameDeadline > tc)
+    {
+        v = tc % refreshDelay;
+        SDL_Delay(v / 1000 + 1); // ceil
+    }
+    frameDeadline = tc + v + refreshDelay;
+}
+
+void ResetFrameDeadline() {
+    frameDeadline = 0;
+}
+
+} // namespace
+
+int CWindow::execute()
+{
+#ifdef USE_SDL2
+    const bool text_input_was_active = SDL_IsTextInputActive();
+    SDL_StopTextInput();
+    if (handlesTextInput()) SDL_StartTextInput();
+#endif
+    m_retVal = 0;
+    SDL_Event event;
+    bool l_loop(true);
+    bool l_render(true);
+    // Re-render the first few frames: on fbdev-style double-buffered targets a
+    // single startup flip can land on a page that the previous app (or the
+    // launcher handing off to us) still overwrites, leaving a stale screen
+    // until the next input-triggered render.
+    int l_warmup(8);
+    // Main loop
+    while (l_loop)
+    {
+        if (l_warmup > 0) {
+            --l_warmup;
+            l_render = true;
+        }
+        // Handle key press
+        while (SDL_PollEvent(&event))
+        {
+            switch (event.type)
+            {
+                case SDL_MOUSEMOTION:
+                    SDL_utils::setMouseCursorEnabled(true);
+                    break;
+                case SDL_MOUSEBUTTONDOWN:
+                    SDL_utils::setMouseCursorEnabled(true);
+                    switch (event.button.button) {
+#ifndef USE_SDL2
+                        case SDL_BUTTON_WHEELUP:
+                            l_render = mouseWheel(0, 1) || l_render;
+                            break;
+                        case SDL_BUTTON_WHEELDOWN:
+                            l_render = mouseWheel(0, -1) || l_render;
+                            break;
+#endif
+                        default:
+                            l_render = this->mouseDown(event.button.button,
+                                           event.button.x, event.button.y)
+                                || l_render;
+                    }
+                    if (m_retVal) l_loop = false;
+                    break;
+#ifndef IGNORE_KEYDOWN
+                case SDL_KEYDOWN: {
+                    //printf("key:%d\n",event.button.button); fflush(stdout);
+                    SDL_utils::setMouseCursorEnabled(false);
+                    if (handleZoomTrigger(event)) {
+                        l_render = true;
+                        break;
+                    }
+                    l_render = this->keyPress(event) || l_render;
+                    if (m_retVal) l_loop = false;
+                    break;
+                }
+#endif
+                case SDL_JOYBUTTONDOWN: {
+                    //printf("joy:%d\n",event.jbutton.button); fflush(stdout);
+                    SDL_utils::setMouseCursorEnabled(false);
+                    SDL_Event key_event{};
+                    key_event.key.keysym.sym = event.jbutton.button == config().key_menu ? config().key_system : event.jbutton.button;
+                    l_render = this->keyPress(key_event) || l_render;
+                    if (m_retVal) l_loop = false;
+                    break;
+                }
+                case SDL_JOYHATMOTION: {
+                    //printf("hat:%d\n",event.jhat.value); fflush(stdout);
+                    SDL_Event hat_event{};
+                    hat_event.key.keysym.sym = 0;
+                    if (event.jhat.value==SDL_HAT_UP) hat_event.key.keysym.sym = CMDR_KEY_UP;
+                    if (event.jhat.value==SDL_HAT_DOWN) hat_event.key.keysym.sym = CMDR_KEY_DOWN;
+                    if (event.jhat.value==SDL_HAT_LEFT) hat_event.key.keysym.sym = CMDR_KEY_LEFT;
+                    if (event.jhat.value==SDL_HAT_RIGHT) hat_event.key.keysym.sym = CMDR_KEY_RIGHT;
+                    joyHatHeld = hat_event.key.keysym.sym;
+
+                    if (hat_event.key.keysym.sym) {
+                        l_render = this->keyPress(hat_event); // always returns false
+                        l_render = true;
+                        if (m_retVal)
+                        l_loop = false;
+                    }
+                    break;
+                }
+                case SDL_JOYAXISMOTION: {
+                    const int axis = event.jaxis.axis;
+                    if (axis != 0 && axis != 1) break; // only the left stick
+                    const int value = event.jaxis.value;
+                    int dir = joyAxisDir[axis];
+                    if (value > kAxisPressThreshold) dir = 1;
+                    else if (value < -kAxisPressThreshold) dir = -1;
+                    else if (value > -kAxisReleaseThreshold && value < kAxisReleaseThreshold) dir = 0;
+                    if (dir == joyAxisDir[axis]) break;
+                    joyAxisDir[axis] = dir;
+                    if (dir == 0) {
+                        joyAxisHeld[axis] = 0;
+                        break;
+                    }
+                    SDL_utils::setMouseCursorEnabled(false);
+                    SDL_Event axis_event{};
+                    if (axis == 0) axis_event.key.keysym.sym = dir < 0 ? CMDR_KEY_LEFT : CMDR_KEY_RIGHT;
+                    else           axis_event.key.keysym.sym = dir < 0 ? CMDR_KEY_UP : CMDR_KEY_DOWN;
+                    joyAxisHeld[axis] = axis_event.key.keysym.sym;
+                    this->keyPress(axis_event);
+                    l_render = true;
+                    if (m_retVal) l_loop = false;
+                    break;
+                }
+                case SDL_QUIT: return m_retVal;
+#ifdef USE_SDL2
+#ifndef IGNORE_TEXTINPUT
+                case SDL_TEXTINPUT:
+                case SDL_TEXTEDITING:
+                    l_render = textInput(event) || l_render;
+                    break;
+#endif
+                case SDL_MOUSEWHEEL:
+                    SDL_utils::setMouseCursorEnabled(true);
+                    l_render
+                        = mouseWheel(event.wheel.x, event.wheel.y) || l_render;
+                    break;
+                case SDL_WINDOWEVENT:
+                    switch (event.window.event) {
+                        case SDL_WINDOWEVENT_EXPOSED:
+                            l_render = true;
+                            break;
+                        case SDL_WINDOWEVENT_SIZE_CHANGED:
+                            l_render = true;
+                            ResetFrameDeadline();
+                            screen.onResize(
+                                event.window.data1, event.window.data2);
+                            triggerOnResize();
+                            break;
+                    }
+                    break;
+#else
+                case SDL_VIDEORESIZE:
+                    l_render = true;
+                    ResetFrameDeadline();
+                    screen.onResize(event.resize.w, event.resize.h);
+                    triggerOnResize();
+                    break;
+#endif
+            }
+        }
+        // Handle key hold
+        if (!l_loop) break;
+        l_render = this->keyHold() || l_render;
+        // Render if necessary
+        if (l_render)
+        {
+            SDL_utils::renderAll();
+            screen.flip();
+            l_render = false;
+        }
+        LimitFrameRate();
+    }
+
+#ifdef USE_SDL2
+    SDL_StopTextInput();
+    if (text_input_was_active) SDL_StartTextInput();
+#endif
+
+    // -1 is used to signal cancellation but we must return 0 in that case.
+    if (m_retVal == -1) m_retVal = 0;
+    return m_retVal;
+}
+
+bool CWindow::handleZoomTrigger(const SDL_Event &event)
+{
+    if (event.type != SDL_KEYDOWN) return false;
+    const auto sym = event.key.keysym.sym;
+    // Zoom on CTRL +/-
+    if ((SDL_GetModState() & KMOD_CTRL) == 0) return false;
+    float factor;
+    switch (sym) {
+        case SDLK_PLUS:
+        case SDLK_KP_PLUS: factor = 1.1f; break;
+        case SDLK_MINUS:
+        case SDLK_KP_MINUS: factor = 1 / 1.1f; break;
+        default: return false;
+    }
+    screen.zoom(factor);
+    triggerOnResize();
+    return true;
+}
+
+void CWindow::triggerOnResize() {
+    CResourceManager::instance().onResize();
+    for (auto *window : Globals::g_windows) window->onResize();
+}
+
+const bool CWindow::keyPress(const SDL_Event &p_event)
+{
+    // Reset timer if running
+    if (m_timer)
+        m_timer = 0;
+    m_lastPressed = p_event.key.keysym.sym;
+    return false;
+}
+
+const bool CWindow::keyHold(void)
+{
+    // Default behavior
+    return false;
+}
+
+bool CWindow::textInput(const SDL_Event &event) { return false; }
+
+void CWindow::onResize() { }
+
+#ifdef USE_SDL2
+bool CWindow::tick(SDL_Keycode keycode)
+#else
+bool CWindow::tick(SDLKey keycode)
+#endif
+{
+#ifdef USE_SDL2
+    bool held = SDL_GetKeyboardState(NULL)[SDL_GetScancodeFromKey(keycode)];
+#else
+    bool held = SDL_GetKeyState(NULL)[keycode];
+#endif
+    held = held || (keycode != 0 && (keycode == joyHatHeld || keycode == joyAxisHeld[0] || keycode == joyAxisHeld[1]));
+    if (held)
+    {
+        if (m_timer)
+        {
+            --m_timer;
+            if (!m_timer)
+            {
+                // Timer continues
+                m_timer = KEYHOLD_TIMER;
+                // Trigger!
+                return true;
+            }
+        }
+        else
+        {
+            // Start timer
+            m_timer = KEYHOLD_TIMER_FIRST;
+        }
+    }
+    else
+    {
+        // Stop timer if running
+        if (m_timer)
+            m_timer = 0;
+    }
+    return false;
+}
+
+bool CWindow::mouseDown(int button, int x, int y) { return false; }
+bool CWindow::mouseWheel(int dx, int dy) { return false; }
+
+const int CWindow::getReturnValue(void) const
+{
+    return m_retVal;
+}
+
+bool CWindow::isFullScreen(void) const
+{
+    // Default behavior
+    return false;
+}
+
+bool CWindow::handlesTextInput() const
+{
+    // Default behavior
+    return false;
+}
