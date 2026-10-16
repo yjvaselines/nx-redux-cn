@@ -1,0 +1,371 @@
+# On-Device Testing & Debugging
+
+adb deploy rules, headless input injection, screenshots, and profiling.
+Hardware facts backing these recipes are in [DEVICES.md](DEVICES.md).
+
+## Deploying binaries over adb
+
+The SD card filesystems have **no ETXTBSY protection** — `adb push` over a
+running elf corrupts the mapped executable in memory. The running process is
+doomed either way; the rules are about recovering cleanly:
+
+- **`nextui.elf` / `minarch.elf`** (always-running core binaries): push over
+  them is fine, **but always `adb reboot` afterward**. Never try to
+  hot-restart instead:
+  - `killall nextui.elf` (SIGTERM) is ignored.
+  - `killall -9 nextui.elf` with no `/tmp/next` queued makes the launch loop
+    read "launcher exited without a next command" as shutdown — **the device
+    powers itself off** and won't reappear on adb until physically powered on.
+- **Any other pak elf**: no reboot needed. Ensure the pak isn't running
+  (`ps w | grep <elf>`), push, relaunch from the menu.
+- OSD tree files have their own rule — see "OSD files" below.
+
+**Verify every deploy** — a push can "succeed" to the wrong place:
+
+- The launcher PATH is `/mnt/SDCARD/.system/bin` first; the platform dir
+  `.system/<plat>/bin` may exist on old cards but not be what runs. Confirm
+  the real target with `readlink /proc/$(pidof nextui.elf)/exe` **before** the
+  first push, and md5sum the pushed file against the local build.
+- Tools paks live at `/mnt/SDCARD/.system/paks/Tools/<Name>.pak/` (flattened
+  layout); stale `.system/<plat>/paks/` dirs on a card are not read.
+- `adb push localdir remotedir` **nests** (`remotedir/localdir/...`) when
+  remotedir exists, instead of merging — a redeploy silently leaves the stale
+  tree in place. Either `rm -rf` the remote dir first or push contents with a
+  glob (`adb push localdir/* remotedir/`). Verify with md5 of a changed file,
+  never just exit status.
+
+### OSD files
+
+When only `skeleton/SYSTEM/osd/` content changed, skip the full build:
+assemble with `./scripts/assemble-osd.sh <dev> <plat> <WxH> <dest>` and push
+the assembled `osd/` (+ `osd-$DEVICE/` on tg5040) over
+`/mnt/SDCARD/.system/`. Then **reboot** — the OSD tree is served through a
+live read-only overlay mount, and pushing into its lowerdir serves **stale
+content** (tg5040) or breaks with ESTALE (tg5050) until the next boot
+re-mounts. See [OSD.md](OSD.md) for the mount mechanics.
+
+### Editing `minuisettings.txt` over adb
+
+nextui caches all settings in memory and `CFG_sync` rewrites the whole file on
+clean shutdown — a `sed` edit followed by a normal reboot gets clobbered by
+the stale cache. Either toggle via the on-device Settings app, or
+`sed -i ... && sync && reboot -f` (force reboot skips the shutdown save).
+
+## Launching apps headlessly (`/tmp/next` injection)
+
+To launch any rom/pak exactly as the UI would, without menu navigation: write
+the command to `/tmp/next` in nextui's own format —
+`'<emu_pak>/launch.sh' '<rom_path>'` — then `kill -9 $(pidof nextui.elf)`.
+The MinUI.pak launch loop evals `/tmp/next` on nextui exit and restarts nextui
+when the app exits. Works on both platforms.
+
+- Safe **only** with `/tmp/next` present (see the bare killall-9 power-off
+  gotcha above).
+- Injections written while an eval'd app is still running are consumed
+  unexecuted by the loop's cleanup — only inject when `nextui.elf` itself has
+  a pid.
+- To end a session remotely, kill the app binary (not nextui) — wrapper
+  cleanup runs and nextui returns on its own. Many apps ignore SIGTERM;
+  `kill -9` the app pid is fine. An aborted shutdown test can leave
+  `/tmp/poweroff` armed and `/tmp/nextui_exec` removed — restore both or the
+  next app exit powers the device off.
+
+## Input injection (headless UI driving)
+
+Inject 24-byte `input_event` structs into the gamepad event node:
+
+- **tg5040 gamepad = `/dev/input/event3`, tg5050 = `/dev/input/event4`**
+  (`TRIMUI Player1`). Power button is `KEY_POWER` on event1 (tg5040) /
+  event2 (tg5050) — both `axp2202-pek`-style PMIC keys.
+- Codes: A=`BTN_EAST` 305, B=`BTN_SOUTH` 304, X=`BTN_WEST` 308,
+  Y=`BTN_NORTH` 307, MENU=316, START=315, SELECT=314; d-pad =
+  `EV_ABS` `ABS_HAT0X/Y` ±1 then 0; L2/R2 = EV_ABS codes 2/5 (value 255 for
+  the screenshot combo). Physical X/Y vs event names are swapped per
+  [INPUT_MAPPING.md](INPUT_MAPPING.md) — verify codes there before chaining
+  blind presses.
+- Busybox `printf` can't emit `\x` escapes — build the 24-byte events on the
+  host (python `struct.pack('<QQHHi', 0, 0, type, code, value)`), push the
+  `.bin` files, and `cat evt_down.bin > /dev/input/eventN; usleep 150000;
+  cat evt_up.bin > ...`. **~150 ms between press and release** or the press is
+  swallowed.
+- **Every event needs a trailing `SYN_REPORT`** (`EV_SYN` type 0, code 0,
+  value 0) in the same write — a bare `EV_KEY`/`EV_ABS` event without it is
+  not treated as a completed input frame and gets dropped. Bundle
+  `key + SYN` into one 48-byte `.bin` per press/release.
+- Keep each adb shell command short (>~4 injected events per call hits
+  "shell command too long"); wrap the sequence in a small on-device script.
+- **An OSD left showing eats all further gamepad injection** (it grabs the
+  pad node, so the foreground app sees nothing and every scripted press goes
+  to the OSD). An injected B press is not a reliable dismissal — `touch
+  /tmp/hide_osdd` is. Check `/tmp/trimui_osd/osdd_show_up` before driving UI,
+  and remember a MENU hold ≥1s (keymon `LONG_PRESS_MS`) pops the OSD
+  mid-test; a MENU release with no other key also opens minarch's in-game
+  menu, leaving it open for the next command's presses to land in.
+- adbd kills its session's process group on disconnect and backgrounded
+  children die with it (even setsid'd ones on session exit) — run
+  start/verify/stop inside one adb shell. For a process that must survive a
+  cable pull: tg5050 has `setsid`; tg5040 has neither `setsid` nor `nohup` —
+  push a tiny dynamically-linked fork→setsid()→fork→execvp daemonizer
+  (static glibc aborts on the 4.9 kernel), with stdio redirected or the adb
+  shell hangs on the inherited pipe.
+
+### The hybrid-sleep trap
+
+With sleep-while-charging active the device re-enters hybrid sleep between
+test steps (~30 s timeout), and fb0 keeps the stale frame so screenshots look
+alive. Chain wake (`KEY_POWER`) + ~2 s + presses + screenshot in **one** adb
+command; check for `SetRawBrightness(0)` at the tail of the app log to detect
+sleep; poke a key every ~15 s during long waits.
+
+- Tool-pak elfs run from an adb shell need the launcher's library path
+  (`export LD_LIBRARY_PATH=/mnt/SDCARD/.system/lib:/mnt/SDCARD/.system/shared/lib:/usr/trimui/lib`)
+  or they die with `libSDL2-2.0.so.0: cannot open shared object file` — and
+  adb output carries `\r`, so match exit codes with `tr -d '\r'` + `RC=1$`,
+  not a bare `grep RC=1` (which also matches `RC=127`).
+
+## Screenshots for verification
+
+- **tg5040**: fb0 is the real scanout — `dd if=/dev/fb0 of=/tmp/fb.raw bs=1048576 count=3`,
+  pull, convert BGRA→PNG (1024×768 on Brick). Or on-device
+  `ffmpeg -f fbdev -i /dev/fb0 -frames:v 1 -c:v mjpeg` (no PNG encoder on
+  device). fb0 shows a **stale frame** until an input-driven redraw — inject
+  one d-pad down/up first.
+- **tg5040 composite (includes the OSD)**: fb0 can never show the OSD panel or
+  toasts — `trimui_osdd` draws on a separate disp layer. The kernel's sunxi
+  write-back debug hook captures the **full composited panel output** instead:
+  `rm -f /tmp/x.bmp; echo /tmp/x.bmp > /sys/class/disp/disp/attr/capture_dump`
+  → after ~1 s the file holds a 54-byte BMP header + W×H×4 BGRA, top-down
+  (strip the header and reuse the fb0 BGRA→PNG converter). Gotchas: the target
+  must **not** already exist (`O_CREAT|O_EXCL`, silent no-op otherwise), the
+  store blocks ~1 s (`disp_delay_ms(1000)`), root-only (0660), it writes
+  from kernel context — target tmpfs (`/tmp`), not the SD card — and the
+  store **eats the final byte** of the written string (it assumes echo's
+  trailing newline; a bare `write()` of the path creates a `.bm` file and the
+  wrong format — verified live 2026-08-30). Verified on
+  Brick fw 1.1.1 (4.9.191), byte-identical to fb0 for plain frames; semantics
+  match `disp_capture_dump_store` in any lichee linux-4.9 disp2 `dev_disp.c`
+  (e.g. CrealityTech/sonic_pad_os). Not present on tg5050 (DRM stack — use
+  [CAPTURE.md](CAPTURE.md) readback there). Adopted by `screenshot.elf` as
+  its tg5040 composite source 2026-08-30 (see [CAPTURE.md](CAPTURE.md)).
+- **tg5050**: fb0 reads black (DRM scanout — see [DEVICES.md](DEVICES.md)).
+  Use the screenshot daemon / DRM readback ([CAPTURE.md](CAPTURE.md)), or the
+  GPU mirror `/tmp/fb_mirror.raw` (1280×720 RGBA, vflipped) while a capture
+  daemon is armed.
+- A 11003-byte JPEG at 1280×720 is the black-frame signature.
+- App logs land at `/mnt/SDCARD/.userdata/<plat>/logs/<name>.txt` — a
+  change-gated `LOG_info` at the suspect site plus this log is often faster
+  than screenshots.
+
+## CPU testing & profiling
+
+**Trap first:** each pak's `launch.sh` sets CPU clocks on entry, and manual /
+killed runs may leave caps behind (e.g. the Files pak caps big cores at
+408 MHz). Check and reset `scaling_max_freq` before benchmarking. After a
+normal app exit, `MinUI.pak/launch.sh` restores the default state
+([DEVICES.md](DEVICES.md) has the tables).
+
+```bash
+# which cores are online
+adb shell "for i in 0 1 2 3 4 5 6 7; do echo \"cpu\$i: \$(cat /sys/devices/system/cpu/cpu\$i/online 2>/dev/null)\"; done"
+
+# freq/governor/min/max for a cluster (tg5050: cpu0=little, cpu4=big)
+adb shell cat /sys/devices/system/cpu/cpu4/cpufreq/scaling_cur_freq \
+  /sys/devices/system/cpu/cpu4/cpufreq/scaling_governor \
+  /sys/devices/system/cpu/cpu4/cpufreq/scaling_min_freq \
+  /sys/devices/system/cpu/cpu4/cpufreq/scaling_max_freq
+
+# sample frequency over time
+for i in 1 2 3 4 5; do adb shell "cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq" && sleep 1; done
+
+# thread affinity of a process
+adb shell "pid=\$(pidof PROCESS_NAME); for tid in \$(ls /proc/\$pid/task/); do \
+  echo \"Thread \$tid: \$(grep Cpus_allowed_list /proc/\$pid/task/\$tid/status)\"; done"
+
+# per-thread CPU usage: sample twice, compare utime deltas
+adb shell "pid=\$(pidof PROCESS_NAME); for tid in \$(ls /proc/\$pid/task/); do \
+  name=\$(cat /proc/\$pid/task/\$tid/comm); stat=\$(cat /proc/\$pid/task/\$tid/stat); \
+  echo \"\$tid [\$name]: cpu=\$(echo \$stat | awk '{print \$39}') utime=\$(echo \$stat | awk '{print \$14}')\"; done"
+
+# cores online/offline, governor, freq range — live
+adb shell "echo 1 > /sys/devices/system/cpu/cpu5/online"
+adb shell "echo performance > /sys/devices/system/cpu/cpu4/cpufreq/scaling_governor"
+adb shell "echo 1584000 > /sys/devices/system/cpu/cpu4/cpufreq/scaling_max_freq"
+```
+
+The `performance` governor locks at `scaling_max_freq` (good for fixed-speed
+tests); `schedutil` scales with load. GPU devfreq `cur_freq` stays at min
+during menu rendering — useless as a first-frame/boot proxy.
+
+## Boot timing
+
+- `adb reboot` + immediate wait-for-device reads the **old** boot — wait for
+  the disconnect first.
+- nextui stamps boot phases to `/tmp/nextui_boottime` (start / gfx init /
+  menu init / first frame).
+
+## USB cable netplay link
+
+Architecture, addressing and invariants are in
+[workspace/all/netplay/README.md](../workspace/all/netplay/README.md#usb-cable-link).
+Host unit tests (frame padding, handshake, state file):
+`workspace/all/usblink/tests/run_tests.sh`.
+
+**Never read the USB role nodes** (`/sys/devices/platform/soc*/usbc0/usb_host`,
+`usb_device`, `usb_null`, `usb_otg`; tg5050 `soc@3000000/10.usbc0/`) — not
+even `cat`, `grep -r` or tab completion. A read flips the port role and kills
+adb; on the Smart Pro S it latched host mode across reboots (no adb, no
+charging from a PC). Only `otg_role` is safe. Recovery is in the README.
+
+Two-device bring-up with one computer:
+
+1. Deploy to device A (it will be the **gadget** side) over adb first, while
+   its main (bottom) port is on the computer.
+2. Re-cable: A's bottom port → B's top (second) port. B keeps its bottom port
+   on the computer, so adb stays on B, the USB-host side (`10.99.0.1`);
+   A is `10.99.0.2`.
+3. Start USB Cable mode on both (wizard, or on B by hand). In `adb shell`,
+   `.system/bin` is not on PATH — use the full path
+   `/mnt/SDCARD/.system/bin/usblink.elf` (the launcher's PATH has it).
+   `start` and `stop` rebind B's gadget, so adb drops for 1–3 s; chain the
+   command and its checks in one `adb shell` or reconnect afterwards.
+4. `usblink.elf status` prints `/tmp/usblink.state`; linked is
+   `USBLINK_LINK=up` with `USBLINK_SIDE`/`USBLINK_LOCAL_IP`/`USBLINK_PEER_IP`.
+   Log: `$LOGS_PATH/usblink.txt` (else `/tmp/usblink.log`).
+5. `ping 10.99.0.2` from B proves the path. busybox `ping` is 1/s, too
+   coarse for jitter: for p99/max use a fixed-interval ICMP pinger (e.g.
+   every 16 ms for 60 s, record each RTT, report loss/p99/max). Baseline:
+   ~1 ms RTT, p99 ≈ 1.5 ms, max ≈ 2.6 ms, 0 loss.
+
+Teardown checks after a session: no daemon, no `nxlink0`, no
+`/sys/kernel/config/usb_gadget/g1/configs/c.1/ffs.net`, adb still up. Cable
+pull: link down at once, relinks ~1 s after re-plug with the same addresses.
+
+`kill -9` of the daemon can't run its gadget detach: the kernel unbinds the
+gadget and **adb stays down** until `usblink.elf stop` repairs it (the
+wizard's `--cleanup` and the next wizard start both run it). Mid-game the
+game freezes, then the in-game menu shows (normal netplay disconnect). Only
+SIGKILL a daemon on the device you are *not* reaching through adb, or have a
+way to run `stop` there (e.g. relaunch the wizard on-device).
+
+## Misc
+
+- `SIGCHLD=SIG_IGN` set anywhere in a process breaks `popen()`/`system()`
+  exit statuses (ECHILD → -1) process-wide — the reason `runCommandAsync`
+  uses double-fork + execvp instead. Symptom seen live: WiFi checks that
+  shell out started failing permanently after the first async spawn.
+- Standalone adb-shell runs of the vendored `keyboard` binary die instantly
+  from a phantom controller event — test it through nextui (START on the main
+  menu opens Search).
+- Host-side script tests live in `scripts/tests/` (installer/catalog logic,
+  PATH-shimmed) — run these before shipping shell changes; there is no C unit
+  harness apart from per-feature host tests (e.g. `common/tests/`,
+  `musicplayer/tests/`).
+- tg5050 OSD overlay mount: `scripts/tests/test-osd-overlay-tg5050.sh`
+  sed-extracts the mount block from the tg5050 `launch.sh` and runs it under
+  busybox sh in a privileged alpine container (docker) against a FAT32 and
+  an ext4 loop-mounted fake card — FAT32 must take the tmpfs staging
+  fallback, ext4 (standing in for the FUSE-mounted exFAT card) must keep the
+  direct SD mount; both must serve the SD tree, the tint layer and the
+  rootfs-only font through the merged view.
+- Device Sync on FAT32: `scripts/tests/test-sync-rsync-fat32.sh` runs the
+  exact `rsync_opts` string from `sync/sync.c` with the container's rsync
+  against a vfat loop image (docker, privileged) — a file with an odd-second
+  mtime must copy once and then not be re-sent after vfat rounds the
+  timestamp to 2-second resolution (`--modify-window=1`).
+- tg5050 post-update cleanup: `scripts/tests/test-update-btmgr-cleanup.sh`
+  runs `workspace/tg5050/install/update.sh` (shipped as
+  `.system/bin/install.sh`, executed once per MinUI.zip install, never on a
+  plain boot) against a fake card in a container and checks the old bluez
+  `btmgr_<date>.tar` backups are removed while unrelated files survive.
+- Turbo fire cadence: `scripts/tests/test-turbo-shaper.sh` compiles
+  `minarch/ma_turbo.c` on the host against a model of both TrimUI input
+  daemons' pulse trains; `scripts/tests/turbo/inject.c` documents the Brick
+  on-device replay recipe (1942, FBN).
+- Menu animations setting: `scripts/tests/test-menu-animations.sh` compiles
+  `common/ui/ui_list.c` on the host (SDL2 headers + the tg5040 platform
+  header via `scripts/tests/hostplat/`; unused symbols left
+  unresolved on purpose) and checks that the shared selection-pill glide
+  snaps when "Show menu animations" is off and still glides when it is on.
+  On-device proof: press d-pad down and `dd` the fb0 list band a few times
+  ~60 ms apart — with the setting off every sample's pill top must sit on a
+  row boundary; with it on at least one sample lands between rows.
+- Music player host units: `workspace/all/musicplayer/tests/run_tests.sh`
+  compiles and runs the sibling `test_*.c` on the host (no SDL, no cross
+  toolchain) — the balance mapping/clamp round trip (`music_balance.c`), request
+  payload validation (`music_request_validation.c`), resume persistence across
+  reloads (`resume.c`, redirected through `NX_MUSIC_RESUME_DIR`), radio catalog
+  parsing (`radio_catalog_parse.c`) and the settings round trip (`settings.c`
+  under `-DMUSIC_SETTINGS_TEST_DIR`). Each `test_*.c` carries its own `cc` line
+  in a `// Build & run` header comment.
+- Music service on-device E2E: `scripts/tests/test-music-service-e2e.sh`
+  cross-compiles the service test, the client test, `musicplayerd` and
+  `musicplayerctl` in the tg5040 toolchain image (`NX_PLATFORM=tg5050` for a
+  Smart Pro S; flags read from the Makefile with `make --eval`, so there is no
+  test target to keep in sync), pushes them
+  to `/tmp` on the device as `*.test.elf`, and runs them over adb with the
+  launcher environment imported from `nextui.elf` so the forked daemon can open
+  the `.asoundrc` PCM. The service test forks a real daemon and drives the
+  socket protocol (split-header writes, back pressure, singleton rejection,
+  oversize/stalled client drops, resume across owner restarts); the client test
+  drives `music_client.c` against a fake owner. Preconditions are in the script
+  header.
+- Removed with the #92 follow-up: the two source-grep music tests
+  (`test_resume_interval.sh`, `test-music-autosleep-source.sh`) and the
+  lock-agnostic `test_player_snapshot.c` — each passed against deliberately
+  broken code (grepping source text, or a snapshot copy that still passed with
+  the locks deleted), so none could fail.
+- On-device E2E for the Settings > Network connect flow (wrong password →
+  error dialog + retry, no profile left behind; stale saved key → same):
+  `scripts/tests/test-wifi-connect-e2e.sh <ssid>`. Drives the real Settings
+  UI on a Brick over adb with the input-injection recipe above; needs a WPA
+  network in range whose password you do not enter. Preconditions are in the
+  script header.
+- Button layout shell side: `scripts/tests/test-button-layout-sh.sh` (helper,
+  N64 config transform, DC mapping selection); OSD daemon variants:
+  `scripts/tests/test-patch-osdd-layout.sh`; pure swap/label logic is in
+  `workspace/all/common/tests/run_tests.sh` (`test_button_layout.c`).
+- PortMaster refresh on update: `scripts/tests/test-update-portmaster-refresh.sh`
+  sed-extracts the marked `portmaster-refresh` block from each platform's
+  `workspace/<plat>/install/update.sh` and runs it under `sh` against a fake
+  card. An installed-but-stale `Tools/PortMaster.pak/launch.sh` and
+  `Emus/PORTS.pak/launch.sh` must be re-copied from the `.system` Xtras
+  catalog and made executable, a leftover `portmaster.elf` and the unused
+  `ports_launch.sh` copy deleted from the tool pak, and a pak still at the pre-flat `Tools/<plat>/PortMaster.pak`
+  moved up (unrelated paks in that folder survive); not-installed (no
+  `Emus/shared/PortMaster/version`), absent `Tools/PortMaster.pak`, and
+  absent catalog dir must each change nothing and never fail the update.
+- PortMaster launcher: `scripts/tests/test-portmaster-launch.sh` runs the
+  catalog `pak/launch.sh` (the tool pak's whole launcher since the elf was
+  retired) under `sh` against a fake card with stub `python3`, `show2.elf`
+  and `nextval.elf`: not-installed screen, patches applied idempotently
+  before/after pugwash, Xbox pad map during pugwash and the Button layout
+  setting restored after, port-script fixes, patchedScripts/ retired,
+  --patch-only, cover-art
+  sync (and the catalog-screenshot fallback for ports with no art), the
+  tg5040 `libGLESv1_CM.so` alias, cache invalidation, the Xtras version
+  marker left to extras.elf, first-run retry and self-update reboot loop;
+  plus `ports_launch.sh`'s patch guard, `.asoundrc` copy, `/roms/ports/<dir>`
+  rewrite and the session bind of the audio routing over `/etc/asound.conf`.
+  Needs GNU sed (`brew install gnu-sed`).
+- PortMaster community catalogs: `scripts/tests/test-extras-portmaster-catalogs.sh`
+  runs the real `portmaster-nextos` / `portmaster-rhh` Xtras `install.sh` and
+  `uninstall.sh` against a fake card with a wget shim: refusal without
+  PortMaster (and, for RHH, without its CA bundle) before any network,
+  source file dropped into `config/` and reset on reinstall, gmtoolkit
+  fetched digest-verified with TLS checked against PortMaster's CA bundle,
+  uninstall removing catalog, cached images, gmtoolkit and markers while
+  installed ports stay. Run every script with its shebang (`./script`), not
+  `sh script`: macOS `sh` is bash in POSIX mode, where `VAR=x func` leaks.
+- TLS verification: `scripts/tests/test-tls-verify.sh` runs the PortMaster
+  and gen1recomp installers' real TLS block (both platforms) against a fake
+  card with and without the system CA bundle: with one, wget must get
+  `--check-certificate=on --ca-certificate=<bundle>` (the vendored GNU wget
+  defaults to no checks, and `--ca-certificate` alone doesn't turn them on);
+  without one, the legacy `--no-check-certificate`. It also checks every
+  installer wget call goes through that flag, RHH's two calls verify,
+  `wget_fetch.c` (system updater, Cheat Database download, network cache)
+  forces checks with a bundle, `cheatdb.c` hands the bundle to its
+  Last-Modified probe, and no other source spells the skip flag. The probe
+  itself is exercised by `scripts/tests/test-cheatdb-data.sh`. Device check
+  (not automatable): an `https://self-signed.badssl.com/` fetch with the
+  same flags must fail (rc 5).

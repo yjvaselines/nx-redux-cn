@@ -1,0 +1,11 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "launch minarch",
+            "type": "shell",
+            "command": "adb push ${workspaceFolder}/workspace/all/minarch/build/tg5040/minarch.elf /mnt/SDCARD/.system/bin/ && adb shell /mnt/SDCARD/.system/dbg/launch.sh :13337 /mnt/SDCARD/.system/bin/minarch.elf /mnt/SDCARD/.system/cores/gpsp_libretro.so /mnt/SDCARD/.system/dbg/mbros3.gba",
+            "problemMatcher":"$gcc",
+        }
+    ]
+}

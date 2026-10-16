@@ -1,0 +1,260 @@
+# Devices & Platforms
+
+Per-device hardware and platform facts. Build/deploy recipes live in
+[BUILD.md](BUILD.md), on-device test recipes in [TESTING.md](TESTING.md).
+
+## Platform ↔ device map
+
+One *platform* is one toolchain/kernel target; several *devices* can share it.
+The Makefile's authoritative list is the `DEVICES` variable
+(`device=platform,overlays,osd-res`):
+
+| Device | `DEVICE` | Platform | Panel | Kernel | SoC cores |
+|---|---|---|---|---|---|
+| Trimui Brick | `brick` | `tg5040` | 1024×768 | 4.9 | 4× A53 (homogeneous) |
+| Trimui Brick Pro | `brickpro` | `tg5040` | 1024×768 | 4.9 | 4× A53 |
+| Trimui Smart Pro | `smartpro` | `tg5040` | 1280×720 | 4.9 | 4× A53 |
+| Trimui Smart Pro S | `smartpros` | `tg5050` | 1280×720 | 5.15 | 8× A55 big.LITTLE (boot policy runs 3: cpu0,1,4) |
+
+The `DEVICE` env var is set at boot and distinguishes same-platform devices.
+Model string: `TRIMUI_MODEL` (e.g. `Trimui Brick Pro`).
+
+## UI scale and asset sheets
+
+- There is no user UI scale. Each device has **one UI scale**, tuned by eye so
+  the UI is the same physical size on every panel (`UIScale_forDevice` in
+  `workspace/all/common/ui_scale.h`). `FIXED_SCALE` is that float, resolved in
+  `GFX_init` (`ui_scale`); the standalone-emulator overlay reads the same value
+  with `UIScale_fromEnvironment()` (`$DEVICE`). Every size rounds on its own
+  (`SCALE1` is `lroundf`), so fractional scales are fine.
+
+  | Device | Panel | Density | Scale |
+  |---|---|---|---|
+  | Brick (tg5040) | 3.2" 1024×768 | ~400 ppi | 3.0 (the reference) |
+  | Brick Pro (tg5040) | 3.95" 1024×768 | ~324 ppi | 2.5 (2.4375 by density; rounded up for whole-px sizes) |
+  | Smart Pro / Smart Pro S | 4.96" 1280×720 | ~296 ppi | 2.25 |
+
+  The Brick Pro and Smart Pro values were seeded from density (3 × ppi / 400)
+  and are pending by-eye tuning. Every scale is snapped to 1/16 (so a 128-unit
+  sheet is whole pixels) and clamped to [1.5, 4].
+- **Tuning a device's scale on hardware:** add `uiscale_dev=<float>` to
+  `/mnt/SDCARD/.userdata/shared/minuisettings.txt` and force-reboot so
+  nextui's shutdown save can't race the edit:
+  `adb shell "echo uiscale_dev=2.5 >> /mnt/SDCARD/.userdata/shared/minuisettings.txt && sync && reboot -f"`.
+  The launcher log shows `[UI] scale 2.5 (<device>)`. A scale with no baked
+  sheet is drawn from the nearest larger sheet, resized at load (nearest
+  neighbour; the log says `scaled from @…x`), which is fine for judging sizes.
+  Remove the line the same way (`sed -i '/^uiscale_dev=/d' … && sync && reboot -f`).
+  Settings saves keep the line (unknown keys survive `CFG_sync`).
+- **Baking a tuned scale:** set it in `UIScale_forDevice`, add it to
+  `DEVICE_SCALES` in `scripts/gen-chrome-assets.py` and `SCALES` in
+  `scripts/gen-nav-icons.py`, and run both; they write `assets@<s>x.png`, its
+  two-thirds indicator sheet and `nav_*@<s>x.png` into `skeleton/SYSTEM/res/`.
+  Home draws at two thirds of the UI scale and the volume indicator likewise.
+- A new glyph in the asset sheet must reach **every** shipped sheet
+  (`assets@{2,3}x.png` by hand, the fractional ones by re-running
+  `gen-chrome-assets.py` from the `scripts/assets/assets@4x.png` master), and
+  all of them deployed together. Pushing only one sheet makes the glyph
+  invisible on devices that load another — this exact mistake has burned a
+  debugging session.
+- Framebuffer format is RGB565 (`FIXED_BPP 2`) — no alpha channel on screen.
+  Anti-aliasing therefore lives on *source* surfaces (PNG alpha, TTF blended
+  alpha) and is consumed by the blit; drawn shapes need coverage-based AA
+  (see `UI_fillRoundedRect` in `common/ui/ui_draw.c`).
+
+## Display topology (critical for capture/screenshots)
+
+The two platforms scan out completely differently:
+
+- **tg5040**: Mali fbdev EGL renders through `/dev/fb0` — fb0 *is* the visible
+  scanout. `dd` from fb0 is a valid screenshot (BGRA). Note fb0 holds a stale
+  frame until the app's next input-driven redraw. `trimui_osdd` renders its
+  overlay into high fb0 panes on this platform.
+- **tg5050**: the UI renders via DRM/KMS (GL). `/dev/fb0` is **never scanned
+  out** — reading it returns black (the only writer is a clear in
+  `PLAT_quitVideo`). Any fbdev-based capture on tg5050 produces a black image.
+  fb0 geometry ioctls are also inconsistent there (virtual_size says
+  1280×1440 while the stride is 720-row 4-byte) — don't trust fb ioctls on
+  tg5050. Capture must use the DRM scanout or the app-published GPU mirror
+  (see [CAPTURE.md](CAPTURE.md)).
+- tg5050's `sunxi-drm` also exposes a `card0-Writeback-1` connector, but it
+  needs DRM master + atomic — unusable from a side daemon. `/dev/g2d` exists
+  (possible future acceleration).
+
+## CPU topology and default state
+
+System default state is set by `MinUI.pak/launch.sh` and restored when an app
+exits:
+
+| Setting | tg5050 | tg5040 |
+|---|---|---|
+| Big core governor | cpu4: userspace | cpu0: userspace |
+| Big core speed | 2160 MHz | 2000 MHz |
+| Little core governor | cpu0: schedutil | N/A (homogeneous) |
+| Little core max | 2000 MHz (hw caps at 1416) | N/A |
+| Cores online | cpu0,1,4 (others offline) | all |
+| MinUI loop restores | scaling_setspeed only | scaling_setspeed only |
+
+Available frequencies:
+
+- tg5050 big (cpu4): 408 672 840 1008 1200 1344 1488 1584 1680 1800 1992 2088 2160 MHz
+- tg5050 little (cpu0): 408 672 792 936 1032 1128 1224 1320 1416 MHz
+- tg5040 (cpu0): 408 600 816 1008 1200 1416 1608 1800 2000 MHz
+
+Notes:
+
+- On tg5050, cores in a cluster share one frequency domain (cpu4-7 together);
+  bringing a core online joins it to the cluster's current frequency.
+- The Smart Pro S is 8-core silicon deliberately run as 3-core by the boot
+  policy — spare cores are a future performance lever (paks may online one,
+  e.g. the screen-record toggle onlines cpu2).
+- **Pak launch scripts own CPU state**: each `.pak`'s `launch.sh` is
+  responsible for setting clocks on entry and cleaning up on exit. Some cap
+  clocks hard, and the tg5050 Tools paks other than Media Player take cpu4
+  offline outright (they run on the little cores); a manual /
+  killed run may leave the cap in place — always check `scaling_max_freq`
+  before benchmarking on device (see [TESTING.md](TESTING.md)).
+- **The launcher drives its own policy** (`workspace/all/nextui/cpu_policy.h`):
+  full range while booting (until 12 s have passed and `launch.sh` has touched
+  `/tmp/nx_boot_done`, 20 s fallback), then `CPU_SPEED_MENU` while navigating
+  and `CPU_SPEED_MENU_IDLE` after 3 s without input. The policy drives
+  `CPU_FREQ_BASE`, which is **cpu0 (all four A53s) on tg5040** — menu 408-1008,
+  idle 408-600; the Brick's 4.9 schedutil parks at `scaling_max_freq` when
+  idle, so that cap *is* the idle operating point — but **cpu4, the big core,
+  on tg5050** — menu 408-672, idle parked at 408, and **cpu4 is taken offline
+  outright** while the launcher runs (`PLAT_setBigCoreOnline`; glide 16 ms
+  median on the two little cores alone). The little cluster (cpu0-1 online),
+  where the launcher UI actually runs, stays at launch.sh's 408-1416 and is
+  what governs menu frame time. `MinUI.pak/launch.sh` onlines cpu4 again
+  (schedutil 408/408) before every pak, so pak scripts still see the 3-core
+  boot policy. A relaunch after a pak finds the marker present and caps at its
+  first frame.
+- **minarch paks declare a CPU profile as data** (spec:
+  `docs/superpowers/specs/2026-09-20-minarch-cpu-profiles-design.md`):
+  `default.cfg` may carry `minarch_cpu_min` / `minarch_cpu_max` (MHz); the in-app
+  CPU Speed "Auto" applies that range (`PLAT_setCPUSpeedRange`: cpu0 on tg5040;
+  every online policy on tg5050), the other presets stay user overrides. On
+  tg5050 the Powersave / Normal / Performance presets pin every online cluster
+  (the little cluster alone when the pak has taken cpu4 offline; values are
+  rounded to that cluster's table, so Normal and Performance both land on 1416
+  there); the launcher's menu speeds stay big-core only. The
+  pak's `launch.sh` decides cores online (tg5050: `echo 0 > cpu4/online` for
+  cores measured full-speed on the little cluster). Profiles come from
+  `scripts/bench` (results in `scripts/bench/results/<plat>/SUMMARY.md`); a
+  core without a ROM on the test cards ships no profile and keeps the full range.
+  `Config_load` loads `default-<DEVICE>.cfg` **instead of** `default.cfg` when one
+  exists (full replacement, not an overlay), so on the Brick the FC/SFC/FBN caps
+  live in their `default-brick.cfg` and `default-brickpro.cfg` too — a key present
+  only in `default.cfg` silently drops on any device that ships an override.
+- **minarch can also pin threads by role** (spec:
+  `docs/superpowers/specs/2026-09-20-minarch-thread-affinity-design.md`):
+  `default.cfg` may carry `minarch_cpu_affinity = none|big|little`. `none` is the
+  default and today's behaviour (including the legacy startup pin). `big` runs the
+  emulation main thread and every core-created thread on the device's **FAST** set
+  and moves minarch's own helpers (frame prep, audio callback, CPU monitor,
+  rewind, achievements sync, screenshot) plus the GPU driver threads to the
+  **SLOW** set; `little` puts the whole process on SLOW. Core sets are per device:
+  **tg5050** FAST = the online big cores cpu4-7 (a pak's `launch.sh` may online
+  cpu5+ when the core uses them), SLOW = cpu0-1; **tg5040** FAST = cpu3, SLOW =
+  cpu0-2 (isolation — the Brick is one homogeneous cluster). Applied before
+  `Core_init`, with a late `mali-` sweep 2 s after the first frame. Built and
+  measured: **PS.pak on tg5050 carries `minarch_cpu_affinity = big`** — its
+  `launch.sh` onlines cpu5 so both big cores serve `pcsxr-drc` and the render +
+  `mali-*` helpers land on cpu0-1, replacing the pak's old `taskset` launch script
+  (`scripts/bench/results/tg5050/AFFINITY.md` 2026-09-21). Every other pak ships
+  off and keeps its cap-only profile.
+
+## Firmware requirements
+
+NX Redux targets current stock firmware and does not bundle firmware libs
+(e.g. `libmpg123.so.0` lives in `/usr/trimui/lib` and only ships from Brick
+firmware 1.1.1 — older firmware kills anything that needs it, such as LÖVE
+ports). The gate is system-level, not per-pak: `workspace/<plat>/install/update.sh`
+compares `/etc/version` against `MIN_FW` (tg5040: **1.1.1**, tg5050: **1.0.1**)
+and warns via the show2 splash without blocking.
+
+- Probe firmware with `cat /etc/version` (`/usr/trimui/version` is empty).
+- The Smart Pro S is a **separate 1.0.x firmware line** — never assume the
+  tg5040 family's 1.1.1 numbering applies to it.
+- Official firmware images: `github.com/trimui/firmware_*` releases.
+  Recovery images are the source for stock OSD extraction (see
+  [OSD.md](OSD.md)).
+
+## Input daemons
+
+- Every device's gamepad appears as `TRIMUI Player1` via a `trimui_inputd`
+  uinput daemon. Event nodes and button codes are in
+  [INPUT_MAPPING.md](INPUT_MAPPING.md).
+- **tg5040 runs the device's own stock `/usr/trimui/bin/trimui_inputd` by
+  absolute path.** A vendored inputd was shipped once (v1.2.0) and broke all
+  input on the Smart Pro — the three tg5040 devices have different input
+  wiring and the daemons are not interchangeable. Absolute-path launch also
+  defends against stale vendored binaries left on updated cards (updates never
+  delete files, and a bare-name PATH lookup would find them).
+- **tg5050 keeps a vendored inputd** — the Smart Pro S Home button
+  (`KEY_HOMEPAGE` 172) needs it for the instant OSD trigger.
+- The same not-interchangeable rule applies to `trimui_osdd`: every model's
+  build differs (different md5), which is why the OSD skeleton has a
+  `device/<dev>/` layer per model.
+
+## Userland/shell limitations
+
+Busybox differs per platform; scripts must target the intersection:
+
+- tg5040 busybox has **no `nohup`, no `setsid`, no `unzip` applet, no
+  multiplexer**. tg5050 has `setsid` and `unzip`.
+- Neither platform ships `rfkill` or `timeout` binaries.
+- Busybox `printf` does **not** emit `\x` hex escapes — on-device binary
+  injection via printf silently fails; build binary files on the host instead
+  (see [TESTING.md](TESTING.md)).
+- Statically-linked glibc binaries abort with `FATAL: kernel too old` on
+  tg5040's 4.9 kernel — cross-compiled helpers must be dynamically linked.
+- `/bin/bash` may exist only as a symlink PortMaster's launcher creates into
+  its own bin — system scripts must be POSIX sh.
+- The vendored Info-Zip `unzip` at `<SDCARD>/.tmp_update/<platform>/unzip`
+  (the updater's own binary) is load-bearing on tg5040 for stock-OSD restore.
+
+## Filesystem facts
+
+- The SD card is exFAT (FUSE-mounted on tg5050) / vfat: **no ETXTBSY
+  protection**, so `adb push` over a running binary corrupts the mapped
+  executable (see [TESTING.md](TESTING.md) for the deploy rules).
+- On **tg5050**, `/mnt/SDCARD` is a **symlink** to `/mnt/sdcard/mmcblk1p1`.
+  Anything comparing paths against `/proc/mounts` or fd targets must
+  `realpath()` first (this silently broke poweroff's SD-unmount protection
+  before `poweroff_next.c` learned to resolve it).
+- tg5040's kernel-4.9 overlayfs rejects the exFAT SD card as a lower layer
+  outright; tg5050's 5.15 accepts it but its fuseblk lower layer lacks
+  `d_type`, so merged-view directory *listings* can come back empty even
+  though path lookups work. Details in [OSD.md](OSD.md).
+
+## Power / PMIC
+
+- tg5040-family devices have an AXP2202 PMIC on i2c-6 addr 0x34;
+  `workspace/all/poweroff_next/poweroff_next.c` pokes it behind
+  `-DHAS_AXP2202_POWEROFF` (tg5040 Makefile only). tg5050 has a different PMIC
+  and ends shutdown in the plain `reboot(POWER_OFF)` syscall.
+- Both platforms run `poweroff_next` from the launch loop on shutdown
+  (`/tmp/poweroff` flag). SDL2 converts the shutdown SIGTERM into `SDL_QUIT`,
+  which `PAD_poll` maps to `PWR_powerOff` — the graceful path for nextui and
+  minarch both.
+- USB gadget state sysfs (`/sys/class/udc/*/state`) **latches** at
+  `configured` forever after the first host connection on tg5050 (clears
+  correctly on tg5040). `axp2202-usb/online` tracks VBUS instantly on both;
+  any "is USB connected" logic must AND both signals, and expect ~4 s of
+  online=1 while still `not attached` on replug.
+
+## Bluetooth / WiFi radio asymmetry
+
+Do **not** harmonize the platforms' BT-off behavior:
+
+- **tg5050** (separate WiFi/BT chips): BT off = `bluetoothctl power off`,
+  keep `bluetoothd` alive (killing it wedges other apps' bluetoothctl calls).
+- **tg5040** (xradio combo chip): BT off must fully stop the stack — a live
+  `bluetoothd` collapses WiFi throughput from ~330 KB/s to ~2 KB/s.
+
+Apps read live radio state (wlan0 `IFF_UP` sysfs flags / raw HCI ioctl), not
+cached config; `generic_bt.c` shell-outs are deadline-killed so an
+externally-stopped daemon can't hang callers. On tg5040 rfkill unblocking is
+`echo 0 > /sys/class/rfkill/rfkill1/soft` (rfkill1 = phy0); `rfkill.elf` is
+only on the launcher PATH, not adb's.

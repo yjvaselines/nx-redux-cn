@@ -1,0 +1,567 @@
+# TrimUI OSD (On-Screen Display) — System Overlay
+
+## Overview
+
+`trimui_osdd` is TrimUI's stock on-screen display daemon. It renders a widget-based overlay on top of any running application using hardware display planes — completely independent of the foreground app's rendering pipeline. No pausing, no signal coordination, no SDL conflicts.
+
+Works on **both TG5040 and TG5050**. TG5050 uses DRM planes (`drmModeSetPlane`), TG5040 uses the sunxi display engine (`/dev/disp` ioctl with hardware channels/layers).
+
+## Architecture
+
+```
+┌─────────────────────────────────────────┐
+│  DRM Display Pipeline (hardware)        │
+│                                         │
+│  Plane 0: Foreground app (nxredux/emu)   │  ← SDL/EGL renders here
+│  Plane 1: OSD overlay (trimui_osdd)     │  ← DRM dumb buffer, composited by hardware
+│                                         │
+│  GPU composites both planes per frame   │
+└─────────────────────────────────────────┘
+```
+
+The OSD renders to a separate DRM plane via `drmModeSetPlane()`. The GPU hardware composites this plane on top of the foreground app's plane automatically. No interference, no tearing, no coordination needed.
+
+## Binary Location
+
+```
+/usr/trimui/osd/trimui_osdd
+```
+
+The binary is model-specific: the Brick, Brick Pro and Smart Pro firmwares each
+ship a different `trimui_osdd` build. The Smart Pro / Smart Pro S builds are not
+interchangeable with the 1024×768 ones, but the Brick build also runs the Brick
+Pro (same SoC, kernel and panel) and is what `device/brickpro/` now ships — see
+the grid-pitch note further down. The main OSD assets are resolution-locked
+(`bg.png` and the `block*.png` tiles: 1024×768/124px grid on Brick and Brick
+Pro vs 1280×720/120px grid on Smart Pro).
+
+The skeleton therefore keeps one layered source tree at `skeleton/SYSTEM/osd/`
+rather than a copy per device:
+
+| Layer | Holds |
+|---|---|
+| `common/` | What every device shares — widgets, icons, progress art, `key.wav` |
+| `res/<WxH>/` | Anything sized to the panel — `bg.png`, `block*.png`, and the `show_*.sh` toast scripts, which differ only in their baked-in coordinates (13 of 14 in `"x"` alone, e.g. 650 vs 850; `show_volume_msg.sh` in both `"x"` and `"y"`) |
+| `device/<dev>/` | `trimui_osdd`, `osdlayout.json`, plus any file that device overrides |
+
+`scripts/assemble-osd.sh` composes those layers during `make package` into the
+shape each platform's `launch.sh` reads: tg5040 gets `osd/` (common) plus
+`osd-$DEVICE/` (res + device), tg5050 gets a single flat `osd/`. Each device zip
+carries only its own assets.
+
+At boot `launch.sh` overlay-mounts the OSD tree read-only onto
+`/usr/trimui/osd`, but the two platforms get there differently. tg5050 mounts
+the SD card's tree directly (`lowerdir=$SYSTEM_PATH/osd:/usr/trimui/osd`)
+when the card is exFAT — the firmware mounts exFAT through FUSE
+(`mount.exfat-fuse`, `fuseblk`), which overlayfs accepts as a layer. A FAT32
+card it cannot: the kernel vfat driver's dentries carry their own
+hash/compare ops, and overlayfs refuses any such layer outright
+(`overlayfs: filesystem on '...' not supported`, EINVAL), which left FAT32
+Smart Pro S cards running the stock rootfs OSD (issue #87 — the reporter
+blamed firmware 1.0.2, but a full 1.0.1↔1.0.2 rootfs/kernel diff changes
+nothing the mount depends on). So when the direct mount fails, tg5050
+`launch.sh` falls back to staging the tree into tmpfs at `/tmp/nx_osd` and
+mounts that (`scripts/tests/test-osd-overlay-tg5050.sh` runs the real block
+against vfat and ext4 loop images in a privileged container).
+tg5040 always stages: its kernel 4.9 overlayfs rejects even the exFAT SD
+card as a lower layer (`overlayfs: filesystem on '...' not supported` — its
+exfat driver's dentry revalidation isn't supported by that overlayfs;
+hardware-verified on Brick 2026-07-26), so there `launch.sh` first copies
+the assembled tree (~1MB, no font) into tmpfs at `/tmp/nx_osd`, then mounts
+from that staging copy (`lowerdir=/tmp/nx_osd:/usr/trimui/osd`). Either way
+`trimui_osdd` reads its hardcoded path, but the bytes actually served come
+from the SD-sourced tree — the stock rootfs underneath is never written,
+since on tg5040 the staging copy lands in tmpfs (RAM), not on disk. Stock-only
+files not shipped on the SD card (notably `regular.ttf`, the 16MB CJK font)
+show through from the rootfs layer beneath the mount, on both platforms. SD
+edits take effect on the next boot — via re-staging on tg5040 (and on a
+FAT32 tg5050 card), immediately on an exFAT tg5050 card — and there is no
+hash stamp on either platform. **Deploy trap:**
+pushing OSD files over adb into the live mount's lowerdir serves stale content
+(tg5040) or ESTALE errors (tg5050) until the next boot — always reboot after
+pushing OSD files. The fast OSD-only deploy recipe (assemble + push + reboot,
+no toolchain build) is in [TESTING.md](TESTING.md). If the mount fails,
+`/tmp/nx_osd_mount_failed` is created and the daemon starts from whatever the
+rootfs already holds; the same marker also covers a failed staging copy (on
+tg5040 always, on tg5050 in the FAT32 fallback). A model that ships no `osd-$DEVICE` overlay at all is a different case:
+the mount (and, on tg5040, the staging copy) is never attempted, so no marker
+is written and nothing fails — `trimui_osdd` simply runs against the full
+firmware OSD already on the rootfs, untouched.
+
+Two behaviors verified on Smart Pro S hardware (2026-07-26) worth knowing:
+directory *listings* through the merged view can come back empty for
+subdirectories (`ls /usr/trimui/osd/widgets` shows nothing) because the SD's
+fuseblk/exFAT lower layer doesn't provide `d_type` — path lookups are
+unaffected and `trimui_osdd` opens everything by explicit path, so the OSD
+works fully; just don't debug the mount with `ls`. This quirk is specific to
+tg5050's direct SD lowerdir; tg5040's lowerdir is the tmpfs staging copy, an
+ordinary filesystem that provides `d_type` fine, so its merged-view listings
+don't have this problem. Separately, the tg5050 firmware self-heals
+`/usr/trimui/osd` back to factory stock during boot, so on that model the
+rootfs stays pristine on its own once nothing rewrites it (under the old
+copy-based sync the heal was silently re-clobbered every boot, which is why
+the hash-stamp gate never actually skipped there).
+
+Devices that ran v1.2.0–v1.2.x wrote NX files directly onto the rootfs's stock
+OSD tree via that release's copy-based sync; the overlay mount above shadows
+those files without cleaning them up. Files that sync wrote but current NX no
+longer ships at all — `.nx_osd_stamp`, since-removed widgets — have nothing
+in the overlay to shadow them, so they can still show through the merged
+view; running the restore below is what clears them. *Settings →
+System → Restore stock OSD* (shown when `$SYSTEM_PATH/osd-stock/$DEVICE.zip` is
+shipped) runs `paks/MinUI.pak/restore-stock-osd.sh`, which reaches under the
+live mount through a temporary bind mount of `/` and unzips the pristine
+stock archive there — the live NX OSD is unaffected and no reboot is needed.
+The unzip itself prefers the Info-Zip `unzip` every installed card already
+carries at `<SDCARD>/.tmp_update/<platform>/unzip` (the updater's own
+vendored binary), falling back to whatever `unzip` is on `PATH` (busybox's
+applet) if that vendored copy is missing or not executable. Stock archives
+are extracted from each model's recovery image by
+`scripts/extract-stock-osd.sh` (see its header for the docker invocation,
+plus an OpenixCard pre-step for Allwinner IMAGEWTY containers like the
+tg5050 recovery image) and verified against
+`skeleton/SYSTEM/osd-stock/<device>.manifest.md5` — each manifest describes
+the zip's contents (paths relative to the archive root) and pins the
+specific recovery-image firmware version it was pulled from (smartpro
+v1.1.1, smartpros v1.0.1, brickpro v1.1.1, brick v1.1.1); restore puts back
+those exact bytes, not whatever newer firmware a given unit may since have
+received.
+
+The Smart Pro binary and assets were extracted from
+`sd_recovery_tg5040_smartpro_ver1.1.1_20251128.img` (stock rootfs, ext4 at
+sector 126478). The Brick Pro's came from
+`sd_recovery_tg4040_brickpro_ver1.1.1_20260717.img` (ext4 at sector 126432 —
+the image holds three 540 MB ext4 filesystems; only the first has a populated
+`/usr/trimui`). Only two files actually differ between the two 1024×768
+models in stock: `trimui_osdd` and `osdlayout.json`; the block tiles and every
+toast script are byte-identical, and Brick Pro now ships the Brick's `bg.png`
+from `res/1024x768/` (its stock background differed only by a small teal
+accent). The stock Brick Pro daemon, however, lays its widget grid out on the
+Smart Pro's 140 px cell pitch (120 px tile + 20 px gap) with an origin of
+(80, 90) instead of the Brick's centred 144 px (124 + 20) grid, so with the
+shared 124 px tiles every multi-cell span overhangs into the gap (~4 px after
+a 4-wide slider) and the whole panel sits left of centre (stock firmware shows
+the same). `device/brickpro/trimui_osdd` is therefore a copy of the **Brick's**
+daemon (stock c3181362…; see the slider layout and input drain patches below for the current md5), not the Brick Pro's stock one (62df0658…): both models are
+the same SoC, kernel and 1024×768 panel, and the Brick build renders the Brick
+Pro identically to the Brick (verified 2026-09-11: grid, focus, toggles,
+in-panel and standalone toasts). The copy carries a two-instruction patch
+(1b120125…, 2026-09-14; current md5 in the input drain patch section) in `do_osd_input_thread`: SDL joystick button 15 —
+the Brick Pro's Home key, which SDL enumerates after the 11 `BTN_*` buttons,
+F1/F2 and the volume keys — now maps to the daemon's cancel key 2 (the one physical B, SDL button 0,
+uses), in place of X's mapping to key 4, which `osd_input` ignores. Reason:
+while shown, the daemon `EVIOCGRAB`s the pad (`input_grab_all` grabs every
+`/dev/input/event*` fd it holds) and the Brick Pro's Home lives only on that
+virtual pad, so keymon's Home toggle never sees the closing press (the Smart
+Pro S is unaffected: its Home is on `sunxi-keyboard`, which the daemon never
+opens). Patch bytes: `0x40b8b4` `cmp w0,#2`→`cmp w0,#15` and `0x40b9b8`
+`mov w0,#4`→`mov w0,#2` (file offset = vaddr − 0x400000). Brick Pro's stock
+layout includes the battery widget, so `device/brickpro/osdlayout.json` keeps it
+(the widget itself lives in the shared `common/widgets/static_battery`, and is
+simply not referenced by the Brick or Smart Pro layouts). Extraction recipe,
+run from a Linux container since macOS cannot mount ext4:
+
+```bash
+dd if=<recovery>.img of=/tmp/fs.img bs=512 skip=126432 count=1105920
+debugfs -R "rdump /usr/trimui/osd /out" /tmp/fs.img
+```
+
+### Button layout variant (`trimui_osdd.xbox`)
+
+Settings > System > Button layout = Xbox makes the bottom face button
+A/confirm everywhere. The daemon hard-codes SDL button 0 (bottom) → key 2
+(cancel) and 1 (right) → key 1 (OK) in `do_osd_input_thread`, so each
+`device/<dev>/` also ships `trimui_osdd.xbox`, derived from the daemon next
+to it by `scripts/patch-osdd-layout.sh <dev>` (md5- and byte-verified; the
+per-device offset/byte table lives in the script, the test
+`scripts/tests/test-patch-osdd-layout.sh` disassembles the result). Smart
+Pro S needs one `csel` condition flip; Brick, Smart Pro and Brick Pro need
+four edits (two branch retargets, one ignored path, one constant) — the Brick
+Pro one keeps Home → cancel. `MinUI.pak/launch.sh` reads
+`nextval.elf buttonlayout` before starting the daemon and runs the `.xbox`
+copy when it is 1; the setting therefore applies at the next boot. Regenerate
+the four variants whenever a stock daemon is replaced.
+
+### Slider layout patch (all four daemons + their `.xbox` variants)
+
+The stock daemons hard-code the slider widget's geometry in `osd_render`
+(type-2 branch): the 60 px `icon0` box sits 30 px inside the tile
+(`add wN, wN, #0x1e`), the 400×30 bar 120 px inside (`mov wN, #0x78`), and the
+fill is `value*385/max + 15`. With the sun glyph occupying the middle 40 px of
+its box, that read as 40 / 40 / 36 px (left pad / icon-to-bar gap / right pad)
+on the 556 px Brick tile and 40 / 40 / 20 on the 540 px Smart Pro tile — two
+spaces on the left against one on the right. Since 2026-09-19 the checked-in
+daemons carry two immediates changed per binary so the pads match and the gap
+tightens to 24 px:
+
+| Device | icon inset | bar inset | left / gap / right | file offsets (icon, bar) | bytes |
+|---|---|---|---|---|---|
+| brick, brickpro | 30 → 36 | 120 → 110 | 46 / 24 / 46 | 0xa764, 0xa784 | `11007842`→`11009042`, `52800f02`→`52800dc2` |
+| smartpro | 30 → 28 | 120 → 102 | 38 / 24 / 38 | 0xa6d4, 0xa6f4 | `11007842`→`11007042`, `52800f02`→`52800cc2` |
+| smartpros (PIE) | 30 → 28 | 120 → 102 | 38 / 24 / 38 | 0xb93c, 0xb968 | `110078e7`→`110070e7`, `52800f07`→`52800cc7` |
+
+Nothing else changes (bar width, fill maths, icon1 centring). Verified by
+disassembly and, on the Brick Pro, by a write-back capture of the open panel.
+The `.xbox` variants are regenerated from the patched daemons by
+`scripts/patch-osdd-layout.sh`, whose md5 table now names the patched
+binaries (see the input drain patch below for the current values); `osd-stock/*.manifest.md5` still list the untouched firmware
+originals. Re-apply this patch (same offsets, verify the old bytes first) if a
+stock daemon is ever replaced.
+
+### Input drain patch (all four daemons + their `.xbox` variants)
+
+`do_osd_input_thread` keeps the pad open while the panel is hidden and
+discards every SDL joystick event it gets — but stock slept 100 ms after each
+discard (`usleep(100000)` right after the failed `trimui_osd_is_actived`
+check). Two consequences, both reproduced by evdev injection on the Brick Pro
+(2026-09-19): (1) events pressed while hidden queue up and are replayed into
+the panel when it next opens if they have not drained yet — ten quick Home
+taps followed by a show 0.5 s later opened the panel and a leftover release
+closed it 2 s on; in a game the backlog is d-pad, A and B releases, so the
+panel could jump focus, flip a toggle or self-cancel on open; (2) on the Brick
+Pro, whose Home release is the daemon's cancel key, keymon's show written at
+the release instant usually activated the panel (33 ms show-file poll) before
+the input thread had pumped its own copy of the release, which then cancelled
+it — 9 of 10 injected taps, 30 ms or 300 ms hold alike, flashed for ~400 ms.
+Since 2026-09-19 the checked-in daemons have that `bl usleep` replaced by a
+`nop`, so hidden-time events are discarded as they arrive (no busy loop:
+`SDL_WaitEvent` blocks when the queue is empty), and the tg5040 keymon defers
+the Home toggle by 80 ms (`HOME_TOGGLE_DELAY_MS`) so the daemon has discarded
+the release before the panel comes up.
+
+| Device | file offset | bytes |
+|---|---|---|
+| brick, brickpro | 0xb8fc | `97ffd931` → `d503201f` |
+| smartpro | 0xb84c | `97ffd94d` → `d503201f` |
+| smartpros (PIE) | 0x12fc4 | `97ffbe0f` → `d503201f` |
+
+Daemon md5s after both patches: brick 1781c904…, brickpro 086f6d70…, smartpro
+9d5ca562…, smartpros 3e8b2247… (the `scripts/patch-osdd-layout.sh` table).
+
+### Idle wait shim (`libosdwait.so`)
+
+Measured 2026-09-19 with the panel hidden and the pad at rest, the daemon
+costs ~6.4% of one core on both the Brick Pro and the Smart Pro S. Two thirds
+of that is `do_osd_input_thread`: it blocks in `SDL_WaitEvent`, the daemon has
+no SDL window, and SDL 2.30's fallback is "pump, `SDL_Delay(1)`" — ~920
+wakeups/s. The two layer threads take ~63 wakeups/s (~1% each) and the main
+loop's 33 ms poll is negligible. The daemon imports only `SDL_WaitEvent`, so
+it cannot be byte-patched to a cheaper poll; instead
+`workspace/all/osdwait/osdwait.c` builds `libosdwait.so`, an `LD_PRELOAD`
+shim both launchers pass when starting the daemon (bare start if the file is
+missing). It reimplements `SDL_WaitEvent` as a loop over the real
+`SDL_WaitEventTimeout(ev, 0)` (via `dlsym(RTLD_NEXT)`), sleeping 20 ms
+between empty polls while `/tmp/trimui_osd/osdd_show_up` is absent and 1 ms
+while it exists. Pending events are returned with no sleep, so a hidden-time
+backlog still drains in one pump and the Brick Pro Home release is discarded
+within ~20 ms — inside keymon's 80 ms deferral. Installed to
+`.system/<platform>/lib/` by the top-level Makefile.
+
+## Dependencies
+
+### Shared Libraries
+
+| Library | Location | Purpose |
+|---------|----------|---------|
+| `libshmvar.so` | `/usr/trimui/lib/` | Shared memory variables (inter-process state) |
+| `libdrm.so.2` | system | DRM/KMS display plane management |
+| `libSDL2` | system | Joystick input (SDL_JoystickOpen, SDL_WaitEvent) |
+
+### Services
+
+| Service | Purpose | Required |
+|---------|---------|----------|
+| `trimui_inputd` | GPIO input daemon, provides `/dev/input/event*` joystick | Yes (for input) |
+
+### Filesystem
+
+| Path | Purpose |
+|------|---------|
+| `/usr/trimui/osd/` | Working directory (must `cd` here before launching) |
+| `/usr/trimui/osd/osdlayout.json` | Widget layout configuration |
+| `/usr/trimui/osd/widgets/` | Widget definitions (config.json, set.sh, refresh.sh per widget) |
+| `/usr/trimui/osd/regular.ttf` | Font for OSD text |
+| `/usr/trimui/osd/*.png` | UI assets (backgrounds, icons, progress bars) |
+| `/tmp/trimui_osd/` | Runtime IPC directory (created by daemon) |
+
+## Starting the Daemon
+
+**Critical**: Must be launched from its own directory.
+
+```bash
+cd /usr/trimui/osd && ./trimui_osdd &
+```
+
+The daemon requires `LD_LIBRARY_PATH` to include `/usr/trimui/lib/` (for `libshmvar.so`). Our `launch.sh` already sets this via:
+
+```bash
+export LD_LIBRARY_PATH=$SYSTEM_PATH/lib:$SHARED_SYSTEM_PATH/lib:/usr/trimui/lib:$LD_LIBRARY_PATH
+```
+
+In our launch.sh (TG5050 only):
+
+```bash
+# Start TrimUI OSD overlay daemon (system-wide quick menu)
+cd /usr/trimui/osd && ./trimui_osdd &
+cd "$SYSTEM_PATH/bin"
+```
+
+## IPC (Inter-Process Communication)
+
+### Trigger Files
+
+| File | Action |
+|------|--------|
+| `touch /tmp/show_osdd` | Show the OSD overlay |
+| `touch /tmp/hide_osdd` | Hide the OSD overlay |
+
+### State File
+
+| File | Meaning |
+|------|---------|
+| `/tmp/trimui_osd/osdd_show_up` | Exists while OSD is visible, removed when hidden |
+
+### Toast Messages
+
+Write JSON to `/tmp/trimui_osd/osd_toast_msg` to show temporary notifications:
+
+```json
+{
+    "type": "volume",
+    "id": "com.trimui.osd.msg.volumeglobal",
+    "duration": 1000,
+    "size": 0,
+    "x": 850,
+    "y": 30,
+    "w": 300,
+    "h": 80,
+    "message": "8 / 20",
+    "font": "",
+    "bg": "",
+    "icon": "",
+    "fontsize": 24,
+    "fontcolor": "FFFFFFFF"
+}
+```
+
+See `/usr/trimui/osd/show_*.sh` scripts for examples.
+
+Toast geometry gotchas (hardware-observed): the `size` field picks a fixed
+background image (0→300px, 1→400, 2→600, 3→1000) and the `w` field is
+ignored. The *stock* toast scripts hardcode x-coordinates that are off-center
+on some panels — compute the center at runtime instead:
+`x=(fbw−bgw)/2`, with `fbw` from `/sys/class/graphics/fb0/virtual_size`
+(reads "width,doubled-height"; take field 1). The daemon consumes the toast
+file within ~2s of the write (consumption = rendered — grepping for the file
+afterwards is a race).
+
+### Widget IPC Directories
+
+Each widget has a directory under `/tmp/trimui_osd/`:
+
+```
+/tmp/trimui_osd/
+├── hotkeyshow              # Contains hotkey name (e.g., "HOME")
+├── osdd_show_up            # Exists when OSD is visible
+├── slider_backlight/
+├── stepper_fanlevel/
+├── toggle_bt/
+├── toggle_cpu/
+├── toggle_led/
+├── toggle_rumble/
+├── toggle_temperature/
+└── toggle_wifi/
+```
+
+## Widget Configuration
+
+### osdlayout.json
+
+```json
+{
+    "hotkey": "MENU+SELECT",
+    "timefadein": 250,
+    "timefadeout": 0,
+    "timeupdatevalue": 3000,
+    "widgetlist": [
+        {"package": "com.trimui.osd.static.pic1"},
+        {"package": "com.trimui.osd.app.musicplayer"},
+        {"package": "com.trimui.osd.slider.backlight"},
+        {"package": "com.trimui.osd.toggle.btenable"},
+        {"package": "com.trimui.osd.toggle.wifienable"},
+        {"package": "com.trimui.osd.toggle.ledenable"},
+        {"package": "com.trimui.osd.toggle.rumble"},
+        {"package": "com.trimui.osd.static.temperature"},
+        {"package": "com.trimui.osd.static.cpuinfo"},
+        {"package": "com.trimui.osd.stepper.fanlevel"}
+    ]
+}
+```
+
+Note: the `hotkey` field is **inert** — the daemon never reads it (the string
+"hotkey" doesn't appear in the binary). The OSD is actually triggered by our
+keymon via `/tmp/show_osdd`: HOME press (instant) or MENU long-press (500ms).
+Verified empirically: a short MENU+SELECT chord does not open the OSD.
+
+### Widget Directory Structure
+
+Each widget under `/usr/trimui/osd/widgets/` has:
+
+```
+widgets/toggle_wifi/
+├── config.json       # Widget metadata (name, type, icons, script names, status file)
+├── set.sh            # config.json "launch": called on press (toggles get an argument)
+└── update.sh         # config.json "update": refreshes the status file (every 3s)
+```
+
+The script names come from `config.json` — toggles use `update.sh`, the static
+widgets (temperature, CPU clock) use `refresh.sh`. The daemon reads the widget's
+current value from the `status` file path in `config.json`.
+
+Both platforms vendor the **complete OSD tree** on the SD card — daemon binary,
+UI assets, toast scripts, and every widget (stock and custom) — assembled per
+device from `skeleton/SYSTEM/osd/` at package time. At boot, `launch.sh`
+overlay-mounts that tree read-only onto `/usr/trimui/osd/` — directly from the
+SD card on tg5050, via a tmpfs staging copy on tg5040 (see "Binary Location"
+above for why) — making the SD card the source of truth regardless of
+firmware version. `regular.ttf` (16MB CJK
+font) is deliberately not shipped on the SD card — the firmware's copy shows
+through from the rootfs layer underneath the mount. `trimui_osdd` has
+`/usr/trimui/osd/` hardcoded in the closed-source binary, so it can't read
+from the SD card directly — the overlay mount is the only way to control it.
+Every model's daemon build differs (different md5), so each lives in its own
+`device/<dev>/` layer.
+
+Activating screenshot, screen record, or power auto-hides the OSD panel
+(`touch /tmp/hide_osdd`) so the user lands back on the app; toasts still
+render while the panel is hidden.
+Note the wifi/bt toggle scripts write the status file optimistically before the
+radio transition completes, so the icon can bounce once via the 3s refresh
+during a slow start (~7s for wifi, longer for BT).
+
+Platform note: on **tg5050** the BT toggle powers the adapter off/on via a live
+`bluetoothd` (matching the Settings app; killing the daemon wedges other apps'
+`bluetoothctl` calls). On **tg5040** it must fully stop the stack — the xradio
+combo chip drops WiFi throughput from ~330 KB/s to ~2 KB/s while bluetoothd
+runs. The apps tolerate losing bluetoothd mid-call via command timeouts in
+`generic_bt.c`.
+
+Capture toggles: both are PID-file driven. `toggle_screenshot` starts/stops
+`screenshot.elf` (daemon owns `/tmp/screenshot.pid`; L2+R2 together captures a
+frame — the widget shows a hint toast on enable, and the daemon toasts
+"Screenshot saved" after each capture). `toggle_screenrecord` runs one shared
+`set.sh` on all devices that starts/stops `screenrecorder.elf` (owns
+`/tmp/screenrecorder.pid`; on tg5050 it also onlines cpu2 for encoding
+headroom, tracked so it never offlines a core it didn't bring up). The
+recorder and the screenshot daemon pick their own capture source per platform
+(DRM scanout / fbdev / app-published GPU mirror); the foreground app's
+`capture_check()` in `generic_video.c` (both platforms) notices the PID files
+on rendered frames and publishes RGBA frames to the `/tmp/fb_mirror.raw` shm,
+guarded by a flock liveness protocol. Full architecture, source ladder, and
+the dirty-flag-rendering interactions: [CAPTURE.md](CAPTURE.md).
+
+### Available Widgets
+
+| Widget | Type | Purpose |
+|--------|------|---------|
+| `slider_backlight` | slider | Screen brightness |
+| `stepper_fan_level` | stepper | Fan speed control |
+| `toggle_bt` | toggle | Bluetooth on/off |
+| `toggle_wifi` | toggle | WiFi on/off |
+| `toggle_led` | toggle | LED strip on/off |
+| `toggle_rumble` | toggle | Master motor switch (`osdctl get/set rumble`, libmsettings shm; gates every app's VIB thread and the shutdown tap) |
+| `toggle_mute` | toggle | Output mute (separate `speaker_mute` flag via `osdctl`; independent of the FN switch; cleared by a volume key press and at boot). Fixed 2026-09-11 — `osdctl set` used to segfault before touching the hardware. The stock volume slider widget was dropped the same day: hardware volume keys already cover it |
+| `app_music` | app | Music widget (3x2, 412×268 ARGB canvas). Drawn by the resident `osdmusic.elf` (`workspace/all/osdmusic`), which `launch.sh` starts and which owns the widget's command FIFO and canvas. It renders the daemon's loaded snapshot (cover, title/artist, prev / play-pause / next with a white focus disc, and below it the Game/Music balance row — down/up switch rows, left/right move the balance) and reacts to the daemon's `enable` / `disable` / `key_a` / `key_b` / `up` / `down` / `left` / `right` lines (all verified to arrive while inside the widget; `disable` is what B produces). Focus colouring mirrors the daemon's own sliders: the daemon draws its focus ring while the widget is merely highlighted, and once entered (A) the active control inside — focus disc, balance knob/fill/value, placeholder hint — takes the theme's primary accent (`color2` in `minuisettings.txt`, re-read when the file changes; the classic OSD green #36FFA0 is only a fallback when the file is unreadable). The daemon's ring (`block*_sel.png`), active-slider fill (`progress_*_sel.png`) and toast frame (`bg_msg_w*.png`) are images, shipped as pure white shapes (the stock Smart Pro ring's translucent white fill was dropped so every model has a plain ring). Both launchers run `osdmusic.elf --tint-osd <src> <dst>` before starting the daemon: it recolours the slider and toast images' white/grey pixels to the accent (brightness-scaled, alpha kept, own PNG writer since SDL_image 2.0.1 has no `IMG_SavePNG`) — in place in the tg5040 tmpfs staging copy, or into `/tmp/nx_osd_tint` stacked as the top overlay layer on tg5050 so the card is never written. The ring is deliberately excluded from the tint (2026-09-19) and stays the shipped white: with a dark accent such as the default #002222 the tinted ring was nearly invisible on the dark tiles. The daemon loads these images once at startup, so an accent change reaches the slider/toast on the next boot (the widget's own controls follow immediately). Touch `/tmp/osdmusic_debug` to log every raw line to `/tmp/osdmusic_cmd.log`. While no loaded daemon snapshot is available it draws a "No music playing / Press A to open Music Player" placeholder, and A writes the Music Player pak path to `/tmp/nextui_open` (`OPEN_PAK_REQUEST_PATH`) plus `/tmp/hide_osdd`; nextui's main loop consumes that file and launches the pak in place exactly like the F1/F2 shortcuts, so nothing is killed. The request is ignored unless `nextui.elf` is the foreground app. `osdmusic.elf` is a passive daemon client and never starts or stops playback. Its `config.json` lives in the `res/<WxH>/` layer, not `common/`, because the grid cell differs: 3x2 / 412×268 on 1024×768, 4x2 / 540×260 on 1280×720; `osdmusic.elf` reads the canvas size and tile name from that file at startup. In every device layout (2026-09-11) |
+| `toggle_power` | toggle | Power off — stock ships an empty `set.sh`; ours implements the launch.sh contract (`rm /tmp/nextui_exec` + `touch /tmp/poweroff` + kill foreground app → `poweroff_next`). In-game press exits minarch without quicksave. |
+| `toggle_screenshot` | toggle | Screenshot daemon on/off (custom; L2+R2 captures to `/mnt/SDCARD/Images/Screenshots`) |
+| `toggle_screenrecord` | toggle | Screen recording on/off (custom; records to `/mnt/SDCARD/Videos/Recordings`) |
+| `static_pic_1` | static | Background/header image (not shipped — removed from the tg5040 vendored tree) |
+| `static_battery` | static | Battery level display |
+| `static_cpu_freq` | static | CPU frequency display |
+| `static_temperature` | static | CPU temperature display |
+| `static_dram` | static | Used-memory display — stock widget was incomplete (empty `set.sh`, no update hook); ours adds `refresh.sh` (MemTotal−MemAvailable) |
+| `app_music` | app | Music player controls — vendored but not in the layout yet; to be integrated with `workspace/all/musicplayer` |
+
+## DRM Plane Details
+
+The daemon creates 4 DRM dumb buffers (1280x720 ARGB8888, ~3.6MB each):
+
+| Buffer | Purpose |
+|--------|---------|
+| `osd` | Main OSD overlay content |
+| `msg` | Toast message layer |
+| `blank` | Blank/transparent buffer for hiding |
+| `ui` | UI elements layer |
+
+Plane control via sysfs:
+
+```
+/sys/class/de_plane/de_plane/attr/rmpos
+```
+
+Shows active planes:
+
+```
+blender@  281000: enable ( ae81000)
+     0   |   true |    0    |  false  | 1280x 720+   0+   0
+     1   |   true |    3    |   true  | 1280x 720+   0+   0
+     2   |   true |    4    |   true  | 1280x 720+   0+   0
+```
+
+## Input Handling
+
+The daemon grabs `/dev/input/event4` (joystick) exclusively while the OSD is visible:
+
+```
+grab link:[/proc/PID/fd/8] -> [/dev/input/event4]
+grab ret=0
+```
+
+This means the foreground app does NOT receive joystick input while the OSD is active — the OSD has exclusive control. When dismissed, the grab is released.
+
+It also attempts to signal `trimui_inputd` via `/tmp/trimui_inputd/grab` but this may not exist in our setup (non-critical).
+
+## Integration with NextUI-Redux
+
+Both platforms use the same approach: `keymon` detects the trigger → toggles OSD via flag files.
+
+### TG5050
+
+- **keymon** detects Home button (`CODE_HOME=172`) and Menu long-press (`CODE_MENU2=316`, 500ms threshold)
+- On trigger: checks `/tmp/trimui_osd/osdd_show_up` to toggle show/hide
+- Menu tap opens the context menu in nxredux
+
+### TG5040
+
+- **keymon** detects Menu long-press (`CODE_MENU2=316`, 500ms threshold) on all
+  tg5040 devices, and additionally a short Home press (`KEY_HOMEPAGE` 172) on
+  the Brick Pro — the only tg5040 device with a Home button. Home toggles on
+  the RELEASE edge: toggling on press let trimui_osdd grab the pad mid-press
+  and consume the release of that same press as a cancel (OSD flashed and
+  closed, 2026-09-14)
+- On trigger: same toggle logic via `/tmp/trimui_osd/osdd_show_up`
+- keymon cannot close the OSD on the Brick Pro: while shown, trimui_osdd grabs
+  the virtual pad that carries Home, so the second press is handled inside
+  the daemon by the patched Home→cancel mapping in `device/brickpro/trimui_osdd`
+  (see the binary section above). Menu long-press cannot close it on any
+  tg5040 device for the same reason; B closes it.
+- Menu tap opens the context menu in nxredux
+
+### nxredux
+
+- `PAD_quickMenuPressed()` returns 0 on all platforms — built-in quick menu disabled
+- OSD is handled entirely by keymon + trimui_osdd
+
+## Known Issues
+
+- `trimui_inputd` grab signaling (`/tmp/trimui_inputd/grab`) may not work if `trimui_inputd` isn't configured for it
+
+Previously listed issues, since fixed:
+
+- ~~Missing `set.sh` for `static_temperature`/`static_cpu_freq`~~ — no-op stubs shipped in the skeleton
+- ~~Fan level widget references `/tmp/system/set_fanlevel`~~ — replaced with an `osdctl`-based script driving NxRedux's fan control
+- ~~WiFi/BT toggles not reflected in Settings, hangs when toggling while Settings open~~ — apps now read live radio state (sysfs/HCI ioctl) instead of cached config, `bluetoothctl` shell-outs are timeout-killed, and `CFG_sync()` re-captures radio state so it can't clobber the OSD's `minuisettings.txt` edits
+
+## Future Work
+
+- Potentially build our own OSD daemon using the same DRM plane approach for full control

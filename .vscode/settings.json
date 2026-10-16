@@ -1,0 +1,12 @@
+{
+  "editor.formatOnSave": false,
+  "[c]": {
+    "editor.defaultFormatter": "llvm-vs-code-extensions.vscode-clangd",
+    "editor.insertSpaces": false,
+    "editor.tabSize": 4,
+    "editor.detectIndentation": false
+  },
+  "clangd.arguments": [
+    "--fallback-style=none"
+  ]
+}

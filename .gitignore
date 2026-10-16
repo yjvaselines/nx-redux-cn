@@ -1,0 +1,11 @@
+build/
+releases/
+toolchains/
+workspace/all/minarch/libretro-common/
+workspace/all/minarch/rcheevos/
+workspace/all/minarch/libchdr/
+workspace/**/libretro-common/
+workspace/**/rcheevos/
+workspace/**/libchdr/
+.DS_Store
+nx-cn-README.md

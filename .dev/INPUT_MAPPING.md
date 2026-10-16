@@ -1,0 +1,213 @@
+# Trimui Brick (TG5040) Input Mapping
+
+## Buttons
+
+| Physical | Linux Event | Hex | SDL Button | Drastic Value |
+|----------|-------------|-----|------------|---------------|
+| A | BTN_B | 0x131 | 1 | 1025 |
+| B | BTN_A | 0x130 | 0 | 1024 |
+| X | BTN_Y | 0x134 | 3 | 1027 |
+| Y | BTN_X | 0x133 | 2 | 1026 |
+| L | BTN_TL | 0x136 | 4 | 1028 |
+| R | BTN_TR | 0x137 | 5 | 1029 |
+| Select | BTN_SELECT | 0x13a | 6 | 1030 |
+| Start | BTN_START | 0x13b | 7 | 1031 |
+| Menu | BTN_MODE | 0x13c | 8 | 1032 |
+| L3 | BTN_THUMBL | 0x13d | 9 | 1033 |
+| R3 | BTN_THUMBR | 0x13e | 10 | 1034 |
+
+## D-pad (HAT mode — default)
+
+| Direction | Linux Event | Value | Drastic Value |
+|-----------|-------------|-------|---------------|
+| Up | ABS_HAT0Y | -1 | 1089 |
+| Down | ABS_HAT0Y | +1 | 1092 |
+| Left | ABS_HAT0X | -1 | 1096 |
+| Right | ABS_HAT0X | +1 | 1090 |
+
+## D-pad (Joystick mode — FN toggle)
+
+| Direction | Linux Event | Value | SDL Axis |
+|-----------|-------------|-------|----------|
+| Up | ABS_Y | -32767 | axis 1 negative |
+| Down | ABS_Y | +32767 | axis 1 positive |
+| Left | ABS_X | -32767 | axis 0 negative |
+| Right | ABS_X | +32767 | axis 0 positive |
+
+## Triggers
+
+| Physical | Linux Event | SDL Axis |
+|----------|-------------|----------|
+| L2 | ABS_Z | axis 2 |
+| R2 | ABS_RZ | axis 5 |
+
+## FN Toggle
+
+| Event | Value | Meaning |
+|-------|-------|---------|
+| SW_TABLET_MODE | 1 | Joystick mode ON |
+| SW_TABLET_MODE | 0 | Joystick mode OFF (hat mode) |
+
+## Notes
+
+- Input device: `TRIMUI Player1` at `/dev/input/event3` (VID=045e PID=028e)
+- SDL2 enumerates buttons sequentially from the KEY capability bitfield (BTN_A=0x130 onwards, skipping absent codes)
+- Drastic button encoding: `1024 + SDL_button_index`
+- Drastic hat encoding: `1088 + SDL_HAT_direction` (UP=1, RIGHT=2, DOWN=4, LEFT=8)
+- Physical button labels follow Nintendo layout (A=right, B=bottom) but Linux event names follow Xbox layout (BTN_A=bottom, BTN_B=right), hence the swap
+
+
+# Trimui Smart Pro S (TG5050) and Trimui Smart Pro (TG5040) Input Mapping
+
+## Buttons
+
+| Physical | Linux Event | Hex | SDL Button | Drastic Value |
+|----------|-------------|-----|------------|---------------|
+| A | BTN_B | 0x131 | 1 | 1025 |
+| B | BTN_A | 0x130 | 0 | 1024 |
+| X | BTN_Y | 0x134 | 3 | 1027 |
+| Y | BTN_X | 0x133 | 2 | 1026 |
+| L | BTN_TL | 0x136 | 4 | 1028 |
+| R | BTN_TR | 0x137 | 5 | 1029 |
+| Select | BTN_SELECT | 0x13a | 6 | 1030 |
+| Start | BTN_START | 0x13b | 7 | 1031 |
+| Menu | BTN_MODE | 0x13c | 8 | 1032 |
+| L3 | BTN_THUMBL | 0x13d | 9 | 1033 |
+| R3 | BTN_THUMBR | 0x13e | 10 | 1034 |
+| Home | KEY_HOMEPAGE | event0 | N/A | Not on gamepad (sunxi-keyboard) |
+
+## D-pad (HAT)
+
+| Direction | Linux Event | Value | Drastic Value |
+|-----------|-------------|-------|---------------|
+| Up | ABS_HAT0Y | -1 | 1089 |
+| Down | ABS_HAT0Y | +1 | 1092 |
+| Left | ABS_HAT0X | -1 | 1096 |
+| Right | ABS_HAT0X | +1 | 1090 |
+
+## Left Analog Stick
+
+| Direction | Linux Event | SDL Axis |
+|-----------|-------------|----------|
+| Up | ABS_Y (negative) | axis 1 negative |
+| Down | ABS_Y (positive) | axis 1 positive |
+| Left | ABS_X (negative) | axis 0 negative |
+| Right | ABS_X (positive) | axis 0 positive |
+| Click | BTN_THUMBL | button 9 |
+
+## Right Analog Stick
+
+| Direction | Linux Event | SDL Axis |
+|-----------|-------------|----------|
+| Up | ABS_RY (negative) | axis 4 negative |
+| Down | ABS_RY (positive) | axis 4 positive |
+| Left | ABS_RX (negative) | axis 3 negative |
+| Right | ABS_RX (positive) | axis 3 positive |
+| Click | BTN_THUMBR | button 10 |
+
+## Triggers
+
+| Physical | Linux Event | SDL Axis |
+|----------|-------------|----------|
+| L2 | ABS_Z | axis 2 |
+| R2 | ABS_RZ | axis 5 |
+
+## Notes
+
+- Input device: `TRIMUI Player1` at `/dev/input/event4` (VID=045e PID=028e)
+- Home button is on `sunxi-keyboard` (event0), not the gamepad — not accessible via SDL joystick API
+- SDL2 enumerates buttons sequentially from the KEY capability bitfield (BTN_A=0x130 onwards, skipping absent codes)
+- Drastic button encoding: `1024 + SDL_button_index`
+- Drastic hat encoding: `1088 + SDL_HAT_direction` (UP=1, RIGHT=2, DOWN=4, LEFT=8)
+- Button mapping is identical to Trimui Brick (TG5040) — same KEY capabilities, same SDL enumeration
+- Physical button labels follow Nintendo layout (A=right, B=bottom) but Linux event names follow Xbox layout (BTN_A=bottom, BTN_B=right), hence the swap
+
+
+# Trimui Brick Pro (TG4040) Input Mapping
+
+Runs on the `tg5040` platform build, but wires more inputs than any other
+Trimui: analog sticks *and* the Brick's FN keys *and* a Home button.
+
+## Buttons
+
+| Physical | SDL Button | Notes |
+|----------|------------|-------|
+| B | 0 | same base layout as Brick / Smart Pro |
+| A | 1 | |
+| Y | 2 | |
+| X | 3 | |
+| L1 | 4 | |
+| R1 | 5 | |
+| Select | 6 | |
+| Start | 7 | |
+| Menu | 8 | |
+| L3 | 9 | **stick click** — on the Brick this index is the FN1 key |
+| R3 | 10 | **stick click** — on the Brick this index is the FN2 key |
+| L4 | 11 | **FN1 key** — Brick Pro only |
+| R4 | 12 | **FN2 key** — Brick Pro only |
+| Minus (volume down) | 13 | same as Brick |
+| Plus (volume up) | 14 | same as Brick |
+| Home | 15 | Brick Pro only; mapped to `BTN_HOME` |
+
+The FN keys moving from 9/10 to 11/12 is the reason `BTN_ID_L4` / `BTN_ID_R4`
+exist at all — on the Brick they could ride on L3/R3 because it has no sticks.
+
+Home enumerates as a gamepad button (index 15) for SDL, and the tg5040 keymon
+also watches `KEY_HOMEPAGE` (evdev 172): on the Brick Pro a short Home press
+toggles the OSD (`workspace/tg5040/keymon/keymon.c`). The other tg5040 devices
+never emit that code; Menu long-press opens the OSD on all of them.
+
+## Notes
+
+- **These SDL indices are inherited from upstream NextUI's Brick Pro support
+  (PR #766 and its `fix: L4 and R4 button mappings` follow-up) and have not yet
+  been confirmed on hardware here.** Everything else in the Brick Pro port was
+  verified against the stock `sd_recovery_tg4040_brickpro_ver1.1.1_20260717.img`
+  rootfs.
+- `/usr/trimui/bin/trimui_inputd` exists on the Brick Pro, so the tg5040 boot
+  path (which starts the device's own stock input daemon by absolute path rather
+  than vendoring one) works unchanged. Its turbo interface is the same
+  `/tmp/trimui_inputd/turbo_*` flag files the other models use.
+- The Smart Pro's analog-pad power-up GPIOs (PD14/PD18) are **commented out** in
+  the Brick Pro's own `runtrimui.sh`, so its sticks need no GPIO poke.
+
+## LED zones (verified against stock firmware)
+
+Five zones, one more than the Brick:
+
+| Zone | sysfs suffix | Brightness node |
+|------|--------------|-----------------|
+| FN 1 key | `f1` | `max_scale_f1f2` (shared with F2) |
+| FN 2 key | `f2` | — (shares F1's node) |
+| Top bar | `m` | `max_scale` |
+| Joysticks | `lr` | `max_scale_lr` |
+| L/R triggers | `rear` | `max_scale_rear` |
+
+Note `lr` means the *joysticks* here, where on the Brick the same node drives the
+triggers. Effect nodes follow the usual pattern
+(`effect_<zone>`, `effect_cycles_<zone>`, `effect_duration_<zone>`,
+`effect_rgb_hex_<zone>`).
+
+
+## Button layout setting (Nintendo / Xbox)
+
+`minuisettings.txt` `buttonlayout=` (0 Nintendo, 1 Xbox) and `hintlabels=`
+(1 = hints show the printed cap, 0 = the logical letter; only differs under
+Xbox). Each process reads both settings once at startup, so leaving Settings
+applies a layout change everywhere but the OSD: the launcher relaunches and
+every pak reads it at its next launch, while the stock OSD daemon keeps
+running and picks it up only at the next boot. A hint-labels change is live
+at once — the Settings app's own hint bar included (`PAD_reloadHintLabels`).
+
+| Layer | Where the swap happens |
+|---|---|
+| Launcher, Settings, every NX pak, minarch (menus, core input, remap capture) | `workspace/all/common/api.c` `PAD_applyLayout()` after raw→logical translation; hint glyphs via `PAD_buttonLabel()` in `GFX_blitButton`/`GFX_getButtonWidth` (`workspace/all/common/button_layout.h`) |
+| DraStic (NDS.pak) | hooked libSDL2 reads `NX_BUTTON_LAYOUT` (exported by `launch.sh` via `$SYSTEM_PATH/bin/nx_button_layout.sh`) and, in the event thread, swaps the A/B and X/Y evdev codes in the keypad `input[]` table before the per-event compares, so the keyboard path (`code[]`, DraStic's menu / `controls_a`) follows. The hooked libSDL2 also swaps button indices `0↔1` and `2↔3` in its Linux joystick driver (`src/joystick/linux/SDL_sysjoystick.c`) under Xbox, because on tg5050 DraStic's only input path is SDL's native joystick (`controls_b`) — the hook's event thread does not read the pad there — so this is what makes the game (and its menu on tg5050) follow |
+| mupen64plus-next (N64.pak) | a minarch libretro core since the move off the standalone mupen64plus: handled by minarch like the other cores |
+| flycast (DC.pak) | a minarch libretro core since the move off standalone flycast: handled by minarch like the other cores. flycast's RetroPad mapping is positional (RetroPad B / bottom = DC A, A / right = B, Y / left = X, X / top = Y; Select = Coin on arcade), so the pak ships no binds |
+| PortMaster ports | `ports_launch.sh` copies `gamecontrollerdb_<layout>.txt`; the pak's own toggle is gone |
+| Files (NextCommander) | `launch.sh` sources the helper and, under Xbox, feeds NextCommander a `/tmp/files.cfg` = platform cfg + `key_open=0 key_parent=1 key_operation=2 key_system=3` (physical joystick indices; the binary's compiled defaults are Nintendo). The patched binary maps MENU to the *configured* system key so it keeps opening the system menu |
+| Stock OSD | `trimui_osdd.xbox` (see OSD.md) |
+
+Bind files on disk (`bind A Button = A`) keep logical labels; only display
+changes.

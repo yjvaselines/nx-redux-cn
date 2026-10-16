@@ -1,0 +1,498 @@
+// Host test for workspace/all/nextui/artbg.c (the "Background" game-art
+// compositor). Pure SDL2 + libm; no device or GFX involved. Asserts the output
+// geometry, right-alignment, the diagonal fade, monotonic opacity, and that
+// straight alpha is preserved for a fully transparent source, and that the art
+// covers the whole fade (no hard edge where the image runs out).
+#include <stdio.h>
+#include <stdlib.h>
+#include <math.h>
+#include <SDL2/SDL.h>
+#include "artbg.h"
+
+static int failures = 0;
+#define CHECK(cond, msg)                \
+	do {                                \
+		if (cond)                       \
+			printf("ok   - %s\n", msg); \
+		else {                          \
+			printf("FAIL - %s\n", msg); \
+			failures++;                 \
+		}                               \
+	} while (0)
+
+static const Uint8 ART_R = 200, ART_G = 100, ART_B = 50;
+
+// Fade boundaries, measured in from the right edge (artbg.c tunables). A wide
+// (16:9) panel uses a narrower strip: 20% / 40% instead of 40% / 60%.
+#define FEATHER 0.25f
+static int is_wide(int w, int h) {
+	return (float)w >= 1.5f * (float)h;
+}
+static float top_frac(int w, int h) {
+	return 1.0f - (is_wide(w, h) ? 0.20f : 0.40f);
+}
+static float bot_frac(int w, int h) {
+	return 1.0f - (is_wide(w, h) ? 0.40f : 0.60f);
+}
+
+static SDL_Surface* make_art(int w, int h, Uint8 a) {
+	SDL_Surface* s = SDL_CreateRGBSurfaceWithFormat(0, w, h, 32, SDL_PIXELFORMAT_ARGB8888);
+	if (!s) {
+		fprintf(stderr, "make_art: %s\n", SDL_GetError());
+		exit(2);
+	}
+	SDL_FillRect(s, NULL, SDL_MapRGBA(s->format, ART_R, ART_G, ART_B, a));
+	return s;
+}
+
+// Alpha at a SCREEN column/row. The composed surface represents screen columns
+// x0..W-1; columns left of x0 are transparent by construction (they are why x0
+// was chosen there), so report 0 for them.
+static Uint8 alpha_at(SDL_Surface* out, int x0, int screen_x, int y) {
+	if (screen_x < x0)
+		return 0;
+	int col = screen_x - x0;
+	if (col < 0 || col >= out->w || y < 0 || y >= out->h)
+		return 0;
+	Uint32 px = ((Uint32*)out->pixels)[(size_t)y * (out->pitch / 4) + col];
+	Uint8 r, g, b, a;
+	SDL_GetRGBA(px, out->format, &r, &g, &b, &a);
+	return a;
+}
+
+static void color_at(SDL_Surface* out, int x0, int screen_x, int y,
+					 Uint8* r, Uint8* g, Uint8* b, Uint8* a) {
+	int col = screen_x - x0;
+	Uint32 px = ((Uint32*)out->pixels)[(size_t)y * (out->pitch / 4) + col];
+	SDL_GetRGBA(px, out->format, r, g, b, a);
+}
+
+int main(void) {
+	const Uint32 FMT = SDL_PIXELFORMAT_ARGB8888;
+
+	// 1. Output size == (W - x0) x H for two resolutions, opaque 640x480 art.
+	int rw[2] = {1280, 1024};
+	int rh[2] = {720, 768};
+	for (int k = 0; k < 2; k++) {
+		int W = rw[k], H = rh[k];
+		SDL_Surface* art = make_art(640, 480, 255);
+		SDL_Surface* out = ArtBg_compose(art, W, H, FMT);
+		char msg[96];
+		snprintf(msg, sizeof(msg), "%dx%d: compose returns a surface", W, H);
+		CHECK(out != NULL, msg);
+		if (out) {
+			int x0 = ArtBg_originX(W, H);
+			snprintf(msg, sizeof(msg), "%dx%d: output size is (W-x0)=%d x H=%d",
+					 W, H, W - x0, H);
+			CHECK(out->w == W - x0 && out->h == H, msg);
+			SDL_FreeSurface(out);
+		}
+		SDL_FreeSurface(art);
+	}
+
+	// The remaining checks use the primary resolution.
+	const int W = 1280, H = 720;
+	const int x0 = ArtBg_originX(W, H);
+	SDL_Surface* art = make_art(640, 480, 255);
+	SDL_Surface* out = ArtBg_compose(art, W, H, FMT);
+	if (!out) {
+		printf("FAIL - compose returned NULL at primary resolution\n");
+		SDL_FreeSurface(art);
+		printf("FAILED\n");
+		return 1;
+	}
+	SDL_LockSurface(out);
+
+	// 2. Right-alignment: the rightmost column (output col W-1-x0) at row H/2 is
+	// opaque and carries the source colour.
+	{
+		Uint8 a = alpha_at(out, x0, W - 1, H / 2);
+		CHECK(a >= 250, "right edge (row H/2) is opaque (alpha >= 250)");
+		Uint8 r, g, b, aa;
+		color_at(out, x0, W - 1, H / 2, &r, &g, &b, &aa);
+		CHECK(abs(r - ART_R) <= 4 && abs(g - ART_G) <= 4 && abs(b - ART_B) <= 4,
+			  "right edge carries the source colour");
+	}
+
+	// 3. Diagonal fade. The bottom boundary sits at 1 - art_width, the top one
+	// ART_BG_LEAN further right.
+	{
+		int top = 0, bot = H - 1;
+		const float TOPF = top_frac(W, H), BOTF = bot_frac(W, H);
+		int xa = (int)(TOPF * W) - (int)(FEATHER * W) - 2; // left of top boundary
+		// Probe 70% of the way from each boundary to the right screen edge: the
+		// ramp reaches full opacity at 85% of that span, so this is deep in it.
+		int xc = (int)(TOPF * W + 0.70f * (1.0f - TOPF) * W); // right of top boundary
+		int xb = (int)(BOTF * W + 0.70f * (1.0f - BOTF) * W); // right of bottom boundary
+		int xd = (int)(BOTF * W) - (int)(FEATHER * W) - 2;	  // left of bottom boundary
+		CHECK(alpha_at(out, x0, xa, top) == 0, "top row: left of boundary is alpha 0");
+		CHECK(alpha_at(out, x0, xc, top) > 128, "top row: right of boundary is opaque-ish");
+		CHECK(alpha_at(out, x0, xb, bot) > 128, "bottom row: right of boundary is opaque-ish");
+		CHECK(alpha_at(out, x0, xd, bot) == 0, "bottom row: left of boundary is alpha 0");
+	}
+
+	// 4. Monotonic: alpha never decreases left to right along row H/2.
+	{
+		int prev = -1, ok = 1;
+		for (int x = x0; x < W; x++) {
+			int a = alpha_at(out, x0, x, H / 2);
+			if (a < prev) {
+				ok = 0;
+				break;
+			}
+			prev = a;
+		}
+		CHECK(ok, "alpha is monotonic non-decreasing along row H/2");
+	}
+
+	SDL_UnlockSurface(out);
+	SDL_FreeSurface(out);
+	SDL_FreeSurface(art);
+
+	// 5. Straight alpha: a fully transparent source yields all-transparent
+	// output (the fade multiplies source alpha, it does not replace it).
+	{
+		SDL_Surface* art0 = make_art(640, 480, 0);
+		SDL_Surface* out0 = ArtBg_compose(art0, W, H, FMT);
+		CHECK(out0 != NULL, "transparent source: compose returns a surface");
+		if (out0) {
+			SDL_LockSurface(out0);
+			int all_zero = 1;
+			int pitch = out0->pitch / 4;
+			Uint32* px = (Uint32*)out0->pixels;
+			for (int y = 0; y < out0->h && all_zero; y++) {
+				for (int x = 0; x < out0->w; x++) {
+					Uint8 r, g, b, a;
+					SDL_GetRGBA(px[(size_t)y * pitch + x], out0->format, &r, &g, &b, &a);
+					if (a != 0) {
+						all_zero = 0;
+						break;
+					}
+				}
+			}
+			SDL_UnlockSurface(out0);
+			CHECK(all_zero, "transparent source: every output pixel has alpha 0");
+			SDL_FreeSurface(out0);
+		}
+		SDL_FreeSurface(art0);
+	}
+
+	// 6. No hard edge: once the fade starts painting on a row, every column to
+	// its right is painted too (a 16:9 panel used to run out of image partway
+	// through the ramp, leaving a visible vertical cut).
+	{
+		SDL_Surface* a2 = make_art(640, 480, 255);
+		int fail_rows = 0;
+		int wide_rw[2] = {1280, 1024};
+		int wide_rh[2] = {720, 768};
+		for (int k = 0; k < 2; k++) {
+			int Wk = wide_rw[k], Hk = wide_rh[k];
+			SDL_Surface* o = ArtBg_compose(a2, Wk, Hk, FMT);
+			if (!o) {
+				fail_rows++;
+				continue;
+			}
+			SDL_LockSurface(o);
+			int xk = ArtBg_originX(Wk, Hk);
+			for (int y = 0; y < Hk; y += 37) {
+				int started = 0;
+				for (int x = xk; x < Wk; x++) {
+					Uint8 a = alpha_at(o, xk, x, y);
+					if (a > 0)
+						started = 1;
+					else if (started) { // went transparent again: a hard edge
+						fail_rows++;
+						break;
+					}
+				}
+			}
+			SDL_UnlockSurface(o);
+			SDL_FreeSurface(o);
+		}
+		CHECK(fail_rows == 0, "art covers the whole fade on 16:9 and 4:3 (no hard edge)");
+		SDL_FreeSurface(a2);
+	}
+
+	// 7. Height fit: the whole height of a landscape source is shown (no
+	// vertical crop), so a marker row at the very top of the art appears in
+	// the composed surface's top row.
+	{
+		SDL_Surface* a3 = make_art(640, 480, 255);
+		SDL_LockSurface(a3);
+		Uint32* p3 = (Uint32*)a3->pixels;
+		int p3pitch = a3->pitch / 4;
+		Uint32 marker = SDL_MapRGBA(a3->format, 10, 240, 20, 255);
+		for (int x = 0; x < a3->w; x++) {
+			p3[x] = marker;									// first source row
+			p3[(size_t)(a3->h - 1) * p3pitch + x] = marker; // last source row
+		}
+		SDL_UnlockSurface(a3);
+
+		int wide_rw[2] = {1280, 1024};
+		int wide_rh[2] = {720, 768};
+		int ok_rows = 0;
+		for (int k = 0; k < 2; k++) {
+			int Wk = wide_rw[k], Hk = wide_rh[k];
+			SDL_Surface* o = ArtBg_compose(a3, Wk, Hk, FMT);
+			if (!o)
+				continue;
+			SDL_LockSurface(o);
+			int xk = ArtBg_originX(Wk, Hk);
+			Uint8 r1, g1, b1, a1, r2, g2, b2, a2;
+			color_at(o, xk, Wk - 1, 0, &r1, &g1, &b1, &a1);
+			color_at(o, xk, Wk - 1, Hk - 1, &r2, &g2, &b2, &a2);
+			if (abs(g1 - 240) <= 6 && abs(g2 - 240) <= 6)
+				ok_rows++;
+			SDL_UnlockSurface(o);
+			SDL_FreeSurface(o);
+		}
+		CHECK(ok_rows == 2, "art height matches the screen (top and bottom rows kept)");
+		SDL_FreeSurface(a3);
+	}
+
+	// 8. The push-right (LIST-LAYOUT §6): art that, fitted to the screen height,
+	// covers the screen width is pushed 20% of its drawn width off the right
+	// edge, narrower art only 7%. A 640x480 source is 1024 wide on 1024x768
+	// (covers: 20%) and 960 on 1280x720 (narrower: 7%).
+	{
+		int wide_rw[2] = {1280, 1024};
+		int wide_rh[2] = {720, 768};
+		int ok_res = 0;
+		for (int k = 0; k < 2; k++) {
+			int Wk = wide_rw[k], Hk = wide_rh[k];
+			// Source with a distinct column 3/4 of the way in (in the visible strip on both screens: at 1/4 the
+			// 7% push leaves it under the fade on 16:9).
+			SDL_Surface* a4 = make_art(640, 480, 255);
+			SDL_LockSurface(a4);
+			Uint32* p4 = (Uint32*)a4->pixels;
+			int p4pitch = a4->pitch / 4;
+			Uint32 mark = SDL_MapRGBA(a4->format, 5, 5, 250, 255);
+			for (int y = 0; y < a4->h; y++)
+				p4[(size_t)y * p4pitch + (a4->w * 3 / 4)] = mark;
+			SDL_UnlockSurface(a4);
+
+			SDL_Surface* o = ArtBg_compose(a4, Wk, Hk, FMT);
+			if (o) {
+				SDL_LockSurface(o);
+				int xk = ArtBg_originX(Wk, Hk);
+				// Expected geometry: height fit, then shifted right 20% or 7%.
+				double drawn_w = 640.0 * (double)Hk / 480.0;
+				double push = drawn_w >= (double)Wk ? 0.20 : 0.07;
+				double left = (double)Wk - drawn_w + push * drawn_w;
+				int want = (int)(left + drawn_w * 0.75 + 0.5);
+				int found = -1;
+				for (int x = xk; x < Wk; x++) {
+					Uint8 r, g, b, a;
+					color_at(o, xk, x, Hk / 2, &r, &g, &b, &a);
+					if (a > 0 && b > 200 && r < 80) {
+						found = x;
+						break;
+					}
+				}
+				if (found >= 0 && abs(found - want) <= 3)
+					ok_res++;
+				SDL_UnlockSurface(o);
+				SDL_FreeSurface(o);
+			}
+			SDL_FreeSurface(a4);
+		}
+		CHECK(ok_res == 2, "20%/7% push-right on 4:3 and 16:9");
+	}
+
+	// 9. A stacked dual-screen source (DS: 320x480) contributes only its top
+	// half: the bottom half's colour must not appear anywhere in the output.
+	{
+		SDL_Surface* ds = SDL_CreateRGBSurfaceWithFormat(0, 320, 480, 32, FMT);
+		SDL_Rect top = {0, 0, 320, 240}, bottom = {0, 240, 320, 240};
+		SDL_FillRect(ds, &top, SDL_MapRGBA(ds->format, 20, 200, 40, 255));
+		SDL_FillRect(ds, &bottom, SDL_MapRGBA(ds->format, 200, 20, 40, 255));
+
+		int seen_top = 0, seen_bottom = 0;
+		SDL_Surface* o = ArtBg_compose(ds, 1280, 720, FMT);
+		if (o) {
+			SDL_LockSurface(o);
+			int pitch = o->pitch / 4;
+			Uint32* px = (Uint32*)o->pixels;
+			for (int y = 0; y < o->h; y += 11) {
+				for (int x = 0; x < o->w; x += 11) {
+					Uint8 r, g, b, a;
+					SDL_GetRGBA(px[(size_t)y * pitch + x], o->format, &r, &g, &b, &a);
+					if (a < 200)
+						continue;
+					if (g > 150 && r < 100)
+						seen_top = 1;
+					if (r > 150 && g < 100)
+						seen_bottom = 1;
+				}
+			}
+			SDL_UnlockSurface(o);
+			SDL_FreeSurface(o);
+		}
+		CHECK(seen_top && !seen_bottom, "stacked DS source uses its top screen only");
+		SDL_FreeSurface(ds);
+	}
+
+	// 10. The fitted box (ArtBg_composeFit: List art = Mix, 3D box art, 2D box
+	// art or Wheel): 384 px wide x 75% of the screen height, its right edge
+	// `margin` px in from the screen's right edge, vertically centred. The
+	// surface IS that box; the art is fitted whole inside it (aspect kept),
+	// right-aligned and vertically centred, with a hard edge (no fade), the art's
+	// own alpha kept and the rest transparent.
+	{
+		int mw[2] = {1024, 1280};
+		int mh[2] = {768, 720};
+		int mm[2] = {18, 14};			// SCALE1(BUTTON_MARGIN) on the Brick / Brick Pro and Smart Pro S
+		int want_x[2] = {622, 882};		// W - margin - 384
+		int want_y[2] = {96, 90};		// (H - box_h) / 2
+		int want_h[2] = {576, 540};		// 0.75 H
+		int art_w[3] = {640, 500, 350}; // 4:3, 1:1, portrait 0.7
+		int art_h[3] = {480, 500, 500};
+		const char* art_name[3] = {"4:3", "1:1", "portrait 0.7"};
+		for (int k = 0; k < 2; k++) {
+			int Wk = mw[k], Hk = mh[k], Mk = mm[k];
+			char msg[160];
+			SDL_Rect box = ArtBg_fitRect(Wk, Hk, Mk);
+			snprintf(msg, sizeof(msg), "%dx%d: fit box is 384x%d at (%d,%d)", Wk, Hk, want_h[k], want_x[k], want_y[k]);
+			CHECK(box.x == want_x[k] && box.y == want_y[k] && box.w == 384 && box.h == want_h[k], msg);
+			snprintf(msg, sizeof(msg), "%dx%d: fit origin x is the box's left x", Wk, Hk);
+			CHECK(ArtBg_fitOriginX(Wk, Hk, Mk) == want_x[k], msg);
+			snprintf(msg, sizeof(msg), "%dx%d: box right edge is margin %d from the screen edge", Wk, Hk, Mk);
+			CHECK(box.x + box.w == Wk - Mk, msg);
+
+			for (int a = 0; a < 3; a++) {
+				// expected contain-fit inside the box, right-aligned, vertically centred
+				int dw, dh;
+				if ((double)art_w[a] * box.h >= (double)box.w * art_h[a]) {
+					dw = box.w;
+					dh = (int)((double)art_h[a] * box.w / art_w[a] + 0.5);
+				} else {
+					dh = box.h;
+					dw = (int)((double)art_w[a] * box.h / art_h[a] + 0.5);
+				}
+				int dx = box.w - dw, dy = (box.h - dh) / 2;
+
+				SDL_Surface* red = SDL_CreateRGBSurfaceWithFormat(0, art_w[a], art_h[a], 32, FMT);
+				SDL_FillRect(red, NULL, SDL_MapRGBA(red->format, 255, 0, 0, 255));
+				SDL_Surface* o = ArtBg_composeFit(red, Wk, Hk, Mk, FMT);
+				snprintf(msg, sizeof(msg), "%dx%d %s: composeFit returns the box-sized surface", Wk, Hk, art_name[a]);
+				CHECK(o != NULL && o->w == box.w && o->h == box.h, msg);
+				if (o && o->w == box.w && o->h == box.h) {
+					SDL_LockSurface(o);
+					Uint8 r, g, b, al;
+					color_at(o, 0, dx, dy, &r, &g, &b, &al);
+					snprintf(msg, sizeof(msg), "%dx%d %s: fitted %dx%d, top-left (%d,%d) opaque red", Wk, Hk,
+							 art_name[a], dw, dh, dx, dy);
+					CHECK(al == 255 && r > 250 && g < 5 && b < 5, msg);
+					snprintf(msg, sizeof(msg), "%dx%d %s: bottom-right fitted pixel opaque", Wk, Hk, art_name[a]);
+					CHECK(alpha_at(o, 0, dx + dw - 1, dy + dh - 1) == 255, msg);
+					snprintf(msg, sizeof(msg), "%dx%d %s: transparent outside the fitted rect", Wk, Hk, art_name[a]);
+					CHECK((dy == 0 || (alpha_at(o, 0, dx, dy - 1) == 0 && alpha_at(o, 0, box.w - 1, dy - 1) == 0)) &&
+							  (dy + dh == box.h ||
+							   (alpha_at(o, 0, dx, dy + dh) == 0 && alpha_at(o, 0, box.w - 1, dy + dh) == 0)) &&
+							  (dx == 0 || alpha_at(o, 0, dx - 1, box.h / 2) == 0),
+						  msg);
+					snprintf(msg, sizeof(msg), "%dx%d %s: right-aligned and vertically centred", Wk, Hk,
+							 art_name[a]);
+					CHECK(dx + dw == box.w && abs((box.h - dh) - 2 * dy) <= 1, msg);
+					snprintf(msg, sizeof(msg), "%dx%d %s: hard edge (left column alpha == middle alpha)", Wk, Hk,
+							 art_name[a]);
+					CHECK(alpha_at(o, 0, dx, box.h / 2) == alpha_at(o, 0, dx + dw / 2, box.h / 2), msg);
+					SDL_UnlockSurface(o);
+				}
+				if (o)
+					SDL_FreeSurface(o);
+				SDL_FreeSurface(red);
+			}
+		}
+		{
+			// 1024x768: the portrait 0.7 art is height-bound at 576 -> ~403 wide, over the box's 384, so it is
+			// width-bound instead: 384 wide and under 576 tall
+			SDL_Surface* p = make_art(350, 500, 255);
+			SDL_Surface* o = ArtBg_composeFit(p, 1024, 768, 18, FMT);
+			int top = -1, bottom = -1;
+			if (o) {
+				SDL_LockSurface(o);
+				for (int y = 0; y < o->h; y++)
+					if (alpha_at(o, 0, 0, y) == 255) {
+						if (top < 0)
+							top = y;
+						bottom = y;
+					}
+				SDL_UnlockSurface(o);
+				SDL_FreeSurface(o);
+			}
+			CHECK(top > 0 && bottom - top + 1 < 576 && bottom - top + 1 > 540,
+				  "1024x768 portrait 0.7: width-bound (384 wide, ~549 tall)");
+			SDL_FreeSurface(p);
+		}
+
+		// Straight alpha: a half-transparent art pixel keeps its alpha.
+		SDL_Surface* half = make_art(640, 480, 128);
+		SDL_Surface* o = ArtBg_composeFit(half, 1024, 768, 18, FMT);
+		int kept = 0;
+		if (o) {
+			SDL_LockSurface(o);
+			Uint8 r, g, b, a;
+			color_at(o, 0, 192, 288, &r, &g, &b, &a);
+			kept = a == 128 && abs(r - ART_R) <= 2 && abs(g - ART_G) <= 2 && abs(b - ART_B) <= 2;
+			SDL_UnlockSurface(o);
+			SDL_FreeSurface(o);
+		}
+		CHECK(kept, "fit: a half-transparent pixel keeps its alpha and colour");
+		SDL_FreeSurface(half);
+
+		// Smooth downscale: a 768x576 opaque 1-px black/white checkerboard
+		// fitted 2:1 into the 384-wide box (384x288) averages to mid-grey (area
+		// average), never pure black or white (which nearest-neighbour would give).
+		SDL_Surface* chk = SDL_CreateRGBSurfaceWithFormat(0, 768, 576, 32, FMT);
+		Uint32* cp = chk->pixels;
+		for (int y = 0; y < chk->h; y++)
+			for (int x = 0; x < chk->w; x++)
+				cp[y * (chk->pitch / 4) + x] = ((x + y) & 1) ? 0xFFFFFFFFu : 0xFF000000u;
+		o = ArtBg_composeFit(chk, 1024, 768, 18, FMT);
+		int grey = 0, probes = 0;
+		if (o && o->w == 384 && o->h == 576) {
+			SDL_LockSurface(o);
+			for (int y = 144; y < 144 + 288; y += 37)
+				for (int x = 0; x < 384; x += 41) {
+					Uint8 r, g, b, a;
+					color_at(o, 0, x, y, &r, &g, &b, &a);
+					probes++;
+					grey += a == 255 && r >= 120 && r <= 136 && g >= 120 && g <= 136 && b >= 120 && b <= 136;
+				}
+			SDL_UnlockSurface(o);
+			SDL_FreeSurface(o);
+		}
+		CHECK(probes > 0 && grey == probes, "fit: a 1-px checkerboard downscaled 2:1 is mid-grey (area average)");
+		SDL_FreeSurface(chk);
+
+		// Smooth upscale: a small wheel (40x10, left half black, right half
+		// white) grown to the box's 384 width blends across the seam
+		// (bilinear) instead of jumping from black to white.
+		SDL_Surface* wheel = SDL_CreateRGBSurfaceWithFormat(0, 40, 10, 32, FMT);
+		Uint32* wp = wheel->pixels;
+		for (int y = 0; y < wheel->h; y++)
+			for (int x = 0; x < wheel->w; x++)
+				wp[y * (wheel->pitch / 4) + x] = x < 20 ? 0xFF000000u : 0xFFFFFFFFu;
+		o = ArtBg_composeFit(wheel, 1024, 768, 18, FMT);
+		int mids = 0, opaque = 0;
+		if (o && o->w == 384 && o->h == 576) {
+			SDL_LockSurface(o);
+			int y = 288; // the fitted 384x96 band's middle row
+			for (int x = 0; x < 384; x++) {
+				Uint8 r, g, b, a;
+				color_at(o, 0, x, y, &r, &g, &b, &a);
+				opaque += a == 255;
+				mids += r > 20 && r < 235;
+			}
+			SDL_UnlockSurface(o);
+			SDL_FreeSurface(o);
+		}
+		CHECK(opaque == 384, "fit: an upscaled wheel fills the box's width, opaque");
+		CHECK(mids >= 8, "fit: an upscaled wheel blends across its seam (bilinear, not nearest)");
+		SDL_FreeSurface(wheel);
+	}
+
+	printf("%s\n", failures ? "FAILED" : "ALL PASSED");
+	return failures ? 1 : 0;
+}
