@@ -1,0 +1,119 @@
+# workspace (all)
+
+###########################################################
+
+ifeq (,$(PLATFORM))
+PLATFORM=$(UNION_PLATFORM)
+endif
+
+ifeq (,$(PLATFORM))
+$(error please specify PLATFORM, eg. PLATFORM=trimui make)
+endif
+
+###########################################################
+
+.PHONY: all
+
+all:
+ifeq ($(PLATFORM), tg5040)
+	cd ./$(PLATFORM)/rfkill && make all
+	cd ./$(PLATFORM)/btmanager && make all
+	cd ./$(PLATFORM)/poweroff_next/ && make
+endif
+ifeq ($(PLATFORM), tg5050)
+	cd ./$(PLATFORM)/btmanager && make all
+	cd ./$(PLATFORM)/poweroff_next/ && make
+endif
+	cd ./$(PLATFORM)/libmsettings && make
+	cd ./$(PLATFORM) && make early # eg. other libs
+	cd ./$(PLATFORM)/keymon && make
+	cd ./$(PLATFORM)/sleepmon && make
+	cd ./all/nextui/ && make
+	cd ./all/minarch/ && make
+	cd ./all/libgametimedb/ && make
+	cd ./all/gametimectl/ && make
+	cd ./all/gametime/ && make
+	cd ./all/syncsettings/ && make
+	cd ./all/taskset/ && make
+	cd ./all/nextval/ && make
+	cd ./all/settings/ && make
+ifneq (,$(filter $(PLATFORM),tg5040 tg5050))
+	cd ./all/ratools/ && make
+endif
+	cd ./all/audiomon && make all
+	cd ./all/show2/ && make
+	cd ./all/screenshot/ && make
+	cd ./all/screenrecorder/ && make
+	cd ./all/musicplayer/ && make all
+	cd ./all/mediaplayer/ && make
+	cd ./all/imageviewer/ && make
+	cd ./all/sync/ && make
+ifneq (,$(filter $(PLATFORM),tg5040 tg5050))
+	cd ./all/netplay-wizard/ && make
+	cd ./all/usblink/ && make
+	cd ./all/emu-options/ && make
+	cd ./all/extras/ && make
+	cd ./all/cheatdb/ && make
+	cd ./all/osdctl/ && make
+	cd ./all/osdmusic/ && make
+	cd ./all/osdwait/ && make
+	cd ./all/n64-netplay-server/ && make
+endif
+	cd ./all/scraper/ && make
+ifdef COMPILE_CORES
+	make cores
+else
+	echo "skipping core build"
+endif
+	cd ./$(PLATFORM) && make
+
+cores:
+	cd ./$(PLATFORM)/cores && make
+
+core:
+ifndef CORE
+	$(error CORE is not set)
+endif
+	cd ./$(PLATFORM)/cores && make $(CORE)
+
+clean:
+	cd ./$(PLATFORM)/keymon && make clean
+	cd ./$(PLATFORM)/sleepmon && make clean
+	cd ./all/syncsettings/ && make cleans
+	cd ./all/taskset/ && make clean
+	cd ./all/show2/ && make clean
+ifeq ($(PLATFORM), tg5040)
+	cd ./$(PLATFORM)/rfkill && make clean
+	cd ./$(PLATFORM)/btmanager && make clean
+	cd ./$(PLATFORM)/poweroff_next/ && make clean
+endif
+ifeq ($(PLATFORM), tg5050)
+	cd ./$(PLATFORM)/btmanager && make clean
+	cd ./$(PLATFORM)/poweroff_next/ && make clean
+endif
+	cd ./$(PLATFORM)/libmsettings && make clean
+	cd ./all/nextui/ && make clean
+	cd ./all/minarch/ && make clean
+	cd ./all/libgametimedb/ && make clean
+	cd ./all/gametimectl/ && make clean
+	cd ./all/gametime/ && make clean
+	cd ./all/nextval/ && make clean
+	cd ./all/settings/ && make clean
+	cd ./all/ratools/ && make clean
+	cd ./all/screenshot/ && make clean
+	cd ./all/screenrecorder/ && make clean
+	cd ./all/audiomon/ && make clean
+	cd ./all/musicplayer/ && make clean
+	cd ./all/mediaplayer/ && make clean
+	cd ./all/imageviewer/ && make clean
+	cd ./all/sync/ && make clean
+	cd ./all/netplay-wizard/ && make clean
+	cd ./all/usblink/ && make clean
+	cd ./all/emu-options/ && make clean
+	cd ./all/extras/ && make clean
+	cd ./all/cheatdb/ && make clean
+	cd ./all/osdctl/ && make clean
+	cd ./all/osdmusic/ && make clean
+	cd ./all/osdwait/ && make clean
+	cd ./all/scraper/ && make clean
+	cd ./$(PLATFORM) && make clean
