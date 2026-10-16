@@ -1,0 +1,731 @@
+#include "ma_internal.h"
+#include "utils.h"
+#include "ma_frontend_opts.h"
+#include "notification.h"
+#include "ui_buttonhintbar.h"
+#include "ra_integration.h"
+#include "ma_core.h"
+#include <libgen.h>
+#include "ma_menu.h"
+#include "ma_config.h"
+#include "ma_options.h"
+#include "ma_cheats.h"
+#include "ma_shaders.h"
+#include "ma_present.h"
+
+static int Menu_messageWithFont(char* message, char** pairs, TTF_Font* f) {
+	Present_stop();
+	GFX_setMode(MODE_MAIN);
+	bool dirty = true;
+	while (1) {
+		GFX_startFrame();
+		PAD_poll();
+
+		if (PAD_justPressed(BTN_A) || PAD_justPressed(BTN_B))
+			break;
+
+		PWR_update(&dirty, NULL, Menu_beforeSleep, Menu_afterSleep);
+
+		if (dirty) {
+			GFX_clear(screen);
+			GFX_blitMessage(f, message, screen, &(SDL_Rect){SCALE1(PADDING), SCALE1(PADDING), screen->w - SCALE1(2 * PADDING), screen->h - SCALE1(PILL_SIZE + PADDING)});
+			UI_renderButtonHintBar(screen, pairs);
+			GFX_flip(screen);
+			dirty = false;
+		} else {
+			GFX_delay();
+		}
+
+		hdmimon();
+	}
+	GFX_setMode(MODE_MENU);
+	return MENU_CALLBACK_NOP; // TODO: this should probably be an arg
+}
+
+int Menu_message(char* message, char** pairs) {
+	return Menu_messageWithFont(message, pairs, font.medium);
+}
+
+
+int OptionFrontend_optionChanged(MenuList* list, int i) {
+	MenuItem* item = &list->items[i];
+	Config_syncFrontend(item->key, item->value);
+	return MENU_CALLBACK_NOP;
+}
+static MenuList OptionFrontend_menu = {
+	.type = MENU_VAR,
+	.title = "前端",
+	.on_change = OptionFrontend_optionChanged,
+	.items = NULL,
+};
+int OptionFrontend_openMenu(MenuList* list, int i) {
+	if (OptionFrontend_menu.items == NULL) {
+		// TODO: where do I free this? I guess I don't :sweat_smile:
+		if (!config.frontend.enabled_count) {
+			int enabled_count = 0;
+			for (int i = 0; i < config.frontend.count; i++) {
+				if (!config.frontend.options[i].lock)
+					enabled_count += 1;
+			}
+			config.frontend.enabled_count = enabled_count;
+			config.frontend.enabled_options = calloc(enabled_count + 1, sizeof(Option*));
+			int j = 0;
+			for (int i = 0; i < config.frontend.count; i++) {
+				Option* item = &config.frontend.options[i];
+				if (item->lock)
+					continue;
+				config.frontend.enabled_options[j] = item;
+				j += 1;
+			}
+		}
+		OptionFrontend_menu.items = calloc(config.frontend.enabled_count + 1, sizeof(MenuItem));
+		for (int j = 0; j < config.frontend.enabled_count; j++) {
+			Option* option = config.frontend.enabled_options[j];
+			MenuItem* item = &OptionFrontend_menu.items[j];
+			item->key = option->key;
+			item->name = option->name;
+			item->desc = option->desc;
+			item->value = option->value;
+			item->values = option->labels;
+		}
+	} else {
+		// update values
+		for (int j = 0; j < config.frontend.enabled_count; j++) {
+			Option* option = config.frontend.enabled_options[j];
+			MenuItem* item = &OptionFrontend_menu.items[j];
+			item->value = option->value;
+		}
+	}
+	Menu_options(&OptionFrontend_menu);
+	return MENU_CALLBACK_NOP;
+}
+
+// case-insensitive strstr; strcasestr is GNU-only and would need _GNU_SOURCE
+// ahead of every include in this TU
+static int containsCI(const char* haystack, const char* needle) {
+	if (!haystack)
+		return 0;
+	size_t nlen = strlen(needle);
+	for (; *haystack; haystack++) {
+		if (strncasecmp(haystack, needle, nlen) == 0)
+			return 1;
+	}
+	return 0;
+}
+
+// The libretro options API has no restart-required flag; every shipped core
+// that has restart-only options marks them with "restart" or "reload" in the
+// label or info text (audited against workspace/*/cores/src). Options that
+// can't take effect while a game is running stay in the pre-launch editor
+// (options.elf) and are hidden from the in-game menu.
+static int Option_requiresRestart(Option* option) {
+	static const char* words[] = {"restart", "reload", NULL};
+	for (int i = 0; words[i]; i++) {
+		if (containsCI(option->name, words[i]) || containsCI(option->desc, words[i]) || containsCI(option->full, words[i]))
+			return 1;
+	}
+	return 0;
+}
+
+static int OptionEmulator_optionChanged(MenuList* list, int i) {
+	MenuItem* item = &list->items[i];
+	// sets config.core.changed; the core picks the new value up through
+	// RETRO_ENVIRONMENT_GET_VARIABLE_UPDATE on its next frame
+	OptionList_setOptionRawValue(&config.core, item->key, item->value);
+	return MENU_CALLBACK_NOP;
+}
+
+static int OptionEmulator_optionDetail(MenuList* list, int i);
+
+static MenuList OptionEmulator_menu = {
+	.type = MENU_FIXED,
+	.title = "核心选项",
+	.on_confirm = OptionEmulator_optionDetail, // TODO: this needs pagination to be truly useful
+	.on_change = OptionEmulator_optionChanged,
+	.items = NULL,
+};
+
+static int OptionEmulator_optionDetail(MenuList* list, int i) {
+	MenuItem* item = &list->items[i];
+
+	if (item->values == NULL) {
+		// This is a category item
+		// Display the corresponding submenu
+		list->category = item->key;
+
+		int prev_enabled_count = config.core.enabled_count;
+		Option** prev_enabled = config.core.enabled_options;
+		MenuItem* prev_items = OptionEmulator_menu.items;
+		char* prev_title = OptionEmulator_menu.title;
+		OptionEmulator_menu.title = item->name; // category display name
+
+		OptionEmulator_openMenu(list, 0);
+		list->category = NULL;
+
+		config.core.enabled_count = prev_enabled_count;
+		config.core.enabled_options = prev_enabled;
+		OptionEmulator_menu.items = prev_items;
+		OptionEmulator_menu.title = prev_title;
+		return MENU_CALLBACK_NOP;
+	} else {
+		Option* option = OptionList_getOption(&config.core, item->key);
+		if (option->full)
+			return Menu_messageWithFont(option->full, (char*[]){"B", "返回", NULL}, font.medium);
+		else
+			return MENU_CALLBACK_NOP;
+	}
+}
+
+static int OptionEmulator_visible(Option* option) {
+	return !option->lock && !option->hidden && !Option_requiresRestart(option);
+}
+
+int OptionEmulator_openMenu(MenuList* list, int index) {
+	if (list->category == NULL) {
+		if (core.update_visibility_callback) {
+			core.update_visibility_callback();
+		}
+	}
+
+	int enabled_count = 0;
+	config.core.enabled_options = calloc(config.core.count + 1, sizeof(Option*));
+	for (int i = 0; i < config.core.count; i++) {
+		Option* item = &config.core.options[i];
+
+		if (!OptionEmulator_visible(item)) {
+			continue;
+		}
+		// Restrict to the current category
+		if (list->category == NULL && item->category) {
+			continue;
+		}
+		if (list->category && (item->category == NULL || strcmp(item->category, list->category))) {
+			continue;
+		}
+
+		config.core.enabled_options[enabled_count++] = item;
+	}
+	config.core.enabled_count = enabled_count;
+	config.core.enabled_options = realloc(config.core.enabled_options, sizeof(Option*) * (enabled_count + 1));
+
+	// If we are at the top level, add the categories — but only those with at
+	// least one visible option, since the restart filter can empty one out
+	int cat_count = 0;
+	OptionCategory** cats = NULL;
+
+	if (list->category == NULL && config.core.categories) {
+		int total = 0;
+		while (config.core.categories[total].key)
+			total++;
+		cats = calloc(total + 1, sizeof(OptionCategory*));
+		for (int c = 0; c < total; c++) {
+			OptionCategory* cat = &config.core.categories[c];
+			for (int i = 0; i < config.core.count; i++) {
+				Option* item = &config.core.options[i];
+				if (OptionEmulator_visible(item) && item->category && !strcmp(item->category, cat->key)) {
+					cats[cat_count++] = cat;
+					break;
+				}
+			}
+		}
+	}
+
+	OptionEmulator_menu.items = calloc(cat_count + config.core.enabled_count + 1, sizeof(MenuItem));
+
+	for (int i = 0; i < cat_count; i++) {
+		OptionCategory* cat = cats[i];
+		MenuItem* item = &OptionEmulator_menu.items[i];
+		item->key = cat->key;
+		item->name = cat->desc;
+		item->desc = cat->info;
+	}
+
+	for (int i = 0; i < config.core.enabled_count; i++) {
+		Option* option = config.core.enabled_options[i];
+		MenuItem* item = &OptionEmulator_menu.items[cat_count + i];
+		item->key = option->key;
+		item->name = option->name;
+		item->desc = option->desc;
+		item->value = option->value;
+		item->values = option->labels;
+	}
+
+	if (cat_count || config.core.enabled_count) {
+		Menu_options(&OptionEmulator_menu);
+	} else {
+		if (list->category) {
+			Menu_message("此分类没有选项。", (char*[]){"B", "返回", NULL});
+		} else {
+			Menu_message("此核心没有可在运行中\n更改的选项。", (char*[]){"B", "返回", NULL});
+		}
+	}
+
+	free(cats);
+	free(OptionEmulator_menu.items);
+	free(config.core.enabled_options);
+	OptionEmulator_menu.items = NULL;
+	config.core.enabled_count = 0;
+	config.core.enabled_options = NULL;
+
+	return MENU_CALLBACK_NOP;
+}
+
+// Block until the user presses a button, then record it (plus MENU as a
+// modifier) into item/button. Used by the controls binder.
+static int OptionBind_pollLoop(MenuItem* item, ButtonMapping* button) {
+	// Binding a MENU+button combo means holding MENU well past keymon's
+	// long-press threshold; the flag tells keymon not to pop the OSD.
+	touch(OSD_SUPPRESS_PATH);
+	int bound = 0;
+	while (!bound) {
+		GFX_startFrame();
+		PAD_poll();
+
+		// NOTE: off by one because of the initial NONE value; id 0 is NONE
+		// itself — no button to poll, and 1 << -1 is undefined behavior
+		for (int id = 1; id <= LOCAL_BUTTON_COUNT; id++) {
+			if (PAD_justPressed(1 << (id - 1))) {
+				item->value = id;
+				button->local = id - 1;
+				if (PAD_isPressed(BTN_MENU)) {
+					item->value += LOCAL_BUTTON_COUNT;
+					button->mod = 1;
+				} else {
+					button->mod = 0;
+				}
+				bound = 1;
+				break;
+			}
+		}
+		GFX_delay();
+		hdmimon();
+	}
+	unlink(OSD_SUPPRESS_PATH);
+	return MENU_CALLBACK_NEXT_ITEM;
+}
+
+int OptionControls_bind(MenuList* list, int i) {
+	MenuItem* item = &list->items[i];
+	if (item->values != button_labels) {
+		return MENU_CALLBACK_NOP;
+	}
+
+	ButtonMapping* button = &config.controls[item->id];
+	return OptionBind_pollLoop(item, button);
+}
+int OptionControls_unbind(MenuList* list, int i) {
+	MenuItem* item = &list->items[i];
+	if (item->values != button_labels)
+		return MENU_CALLBACK_NOP;
+
+	ButtonMapping* button = &config.controls[item->id];
+	button->local = -1;
+	button->mod = 0;
+	return MENU_CALLBACK_NOP;
+}
+int OptionControls_optionChanged(MenuList* list, int i) {
+	MenuItem* item = &list->items[i];
+	if (item->values != gamepad_labels)
+		return MENU_CALLBACK_NOP;
+
+	if (has_custom_controllers) {
+		gamepad_type = item->value;
+		int device = strtol(gamepad_values[item->value], NULL, 0);
+		core.set_controller_port_device(0, device);
+		core.set_controller_port_device(1, device); // player 2 (netplay) gets the same pad
+	}
+	return MENU_CALLBACK_NOP;
+}
+static MenuList OptionControls_menu = {
+	.type = MENU_INPUT,
+	.title = "按键设置",
+	.desc = "按 A 设置，按 X 清除。"
+			"\n支持单键和 MENU+键组合。" // TODO: not supported on nano because POWER doubles as MENU
+,
+	.on_confirm = OptionControls_bind,
+	.on_change = OptionControls_unbind,
+	.items = NULL};
+
+int OptionControls_openMenu(MenuList* list, int i) {
+	if (OptionControls_menu.items == NULL) {
+		// TODO: where do I free this?
+		OptionControls_menu.items = calloc(RETRO_BUTTON_COUNT + 1 + has_custom_controllers, sizeof(MenuItem));
+		int k = 0;
+
+		if (has_custom_controllers) {
+			MenuItem* item = &OptionControls_menu.items[k++];
+			item->name = "手柄";
+			item->desc = "选择手柄类型。";
+			item->value = gamepad_type;
+			item->values = gamepad_labels;
+			item->on_change = OptionControls_optionChanged;
+		}
+
+		for (int j = 0; config.controls[j].name; j++) {
+			ButtonMapping* button = &config.controls[j];
+			if (button->ignore)
+				continue;
+
+			MenuItem* item = &OptionControls_menu.items[k++];
+			item->id = j;
+			item->name = button->name;
+			item->desc = NULL;
+			item->value = button->local + 1;
+			if (button->mod)
+				item->value += LOCAL_BUTTON_COUNT;
+			item->values = button_labels;
+		}
+	} else {
+		// update values
+		int k = 0;
+
+		if (has_custom_controllers) {
+			MenuItem* item = &OptionControls_menu.items[k++];
+			item->value = gamepad_type;
+		}
+
+		for (int j = 0; config.controls[j].name; j++) {
+			ButtonMapping* button = &config.controls[j];
+			if (button->ignore)
+				continue;
+
+			MenuItem* item = &OptionControls_menu.items[k++];
+			item->value = button->local + 1;
+			if (button->mod)
+				item->value += LOCAL_BUTTON_COUNT;
+		}
+	}
+	Menu_options(&OptionControls_menu);
+	return MENU_CALLBACK_NOP;
+}
+
+char* getSaveDesc(void) {
+	switch (config.loaded) {
+	case CONFIG_NONE:
+		return "正在使用默认设置。";
+	case CONFIG_CONSOLE:
+		return "正在使用主机配置。";
+	case CONFIG_GAME:
+		return "正在使用游戏配置。";
+	}
+	return NULL;
+}
+
+int OptionSaveChanges_onConfirm(MenuList* list, int i) {
+	char* message;
+	switch (i) {
+	case 0: {
+		Config_write(CONFIG_WRITE_ALL);
+		message = "已为主机保存。";
+		break;
+	}
+	case 1: {
+		Config_write(CONFIG_WRITE_GAME);
+		message = "已为游戏保存。";
+		break;
+	}
+	default: {
+		Config_restore();
+		if (config.loaded)
+			message = "已恢复主机默认设置。";
+		else
+			message = "已恢复默认设置。";
+		break;
+	}
+	}
+	Menu_message(message, (char*[]){"A", "确定", NULL});
+	OptionSaveChanges_updateDesc();
+	return MENU_CALLBACK_EXIT;
+}
+static MenuList OptionSaveChanges_menu = {
+	.type = MENU_LIST,
+	.title = "保存更改",
+	.on_confirm = OptionSaveChanges_onConfirm,
+	.items = (MenuItem[]){
+		{"为主机保存"},
+		{"为游戏保存"},
+		{"恢复默认"},
+		{NULL},
+	}};
+int OptionSaveChanges_openMenu(MenuList* list, int i) {
+	OptionSaveChanges_updateDesc();
+	OptionSaveChanges_menu.desc = getSaveDesc();
+	Menu_options(&OptionSaveChanges_menu);
+	return MENU_CALLBACK_NOP;
+}
+
+int OptionCheats_optionChanged(MenuList* list, int i) {
+	MenuItem* item = &list->items[i];
+	struct Cheat* cheat = &cheatcodes.cheats[i];
+
+	// Block enabling cheats in RetroAchievements hardcore mode
+	if (RA_isHardcoreModeActive() && item->value) {
+		Notification_push(NOTIFICATION_ACHIEVEMENT, "硬核模式下作弊码已禁用", NULL);
+		item->value = 0; // Revert the toggle
+		return MENU_CALLBACK_NOP;
+	}
+
+	cheat->enabled = item->value;
+	Core_applyCheats(&cheatcodes);
+	return MENU_CALLBACK_NOP;
+}
+
+int OptionCheats_optionDetail(MenuList* list, int i) {
+	MenuItem* item = &list->items[i];
+	struct Cheat* cheat = &cheatcodes.cheats[i];
+	if (cheat->info)
+		return Menu_message((char*)cheat->info, (char*[]){"B", "返回", NULL});
+	else
+		return MENU_CALLBACK_NOP;
+}
+
+static MenuList OptionCheats_menu = {
+	.type = MENU_FIXED,
+	.title = "作弊码",
+	.on_confirm = OptionCheats_optionDetail, // TODO: this needs pagination to be truly useful
+	.on_change = OptionCheats_optionChanged,
+	.items = NULL,
+};
+int OptionCheats_openMenu(MenuList* list, int i) {
+	if (OptionCheats_menu.items == NULL) {
+		// populate
+		OptionCheats_menu.items = calloc(cheatcodes.count + 1, sizeof(MenuItem));
+		for (int i = 0; i < cheatcodes.count; i++) {
+			struct Cheat* cheat = &cheatcodes.cheats[i];
+			MenuItem* item = &OptionCheats_menu.items[i];
+
+			// this stuff gets actually copied around.. what year is it?
+			int len = strlen(cheat->name) + 1;
+			item->name = calloc(len, sizeof(char));
+			strcpy(item->name, cheat->name);
+
+			if (cheat->info) {
+				len = strlen(cheat->info) + 1;
+				item->desc = calloc(len, sizeof(char));
+				strncpy(item->desc, cheat->info, len);
+				GFX_wrapText(font.tiny, item->desc, DEVICE_WIDTH - SCALE1(2 * PADDING), 2);
+			}
+
+			item->value = cheat->enabled;
+			item->values = onoff_labels;
+		}
+	} else {
+		// update
+		for (int j = 0; j < cheatcodes.count; j++) {
+			struct Cheat* cheat = &cheatcodes.cheats[j];
+			MenuItem* item = &OptionCheats_menu.items[j];
+			item->value = cheat->enabled;
+		}
+	}
+
+	if (OptionCheats_menu.items[0].name) {
+		Menu_options(&OptionCheats_menu);
+	} else {
+		// we expect at most CHEAT_MAX_PATHS paths with MAX_PATH length, just hardcode it here
+		char paths[CHEAT_MAX_PATHS][MAX_PATH];
+		int count = 0;
+		Cheat_getPaths(paths, &count);
+
+		// concatenate all paths into one string, and prepend title "未加载作弊码文件。\n\n"
+		// each path on its own line, and remove the absolute path prefix
+		char cheats_path[CHEAT_MAX_LIST_LENGTH] = {0};
+
+		// prepend title with bounds checking
+		const char* title = "未加载作弊码文件。\n请从 Xtras > 作弊码数据库 获取。\n\n";
+		size_t title_len = strlen(title);
+
+		strcpy(cheats_path, title); // Use strcpy for first string
+		size_t current_len = title_len;
+
+		for (int i = 0; i < count && i < CHEAT_MAX_DISPLAY_PATHS; i++) {
+			char* p = basename(paths[i]);
+
+			// Check for NULL return from basename
+			if (p == NULL) {
+				continue;
+			}
+
+			size_t p_len = strlen(p);
+			size_t newline_len = (i < count - 1) ? 1 : 0; // "\n" length
+
+			// Check if adding this path would overflow the buffer
+			if (current_len + p_len + newline_len >= CHEAT_MAX_LIST_LENGTH) {
+				strcat(cheats_path, "...");
+				break;
+			}
+
+			// Safe to append
+			strcat(cheats_path, p);
+			current_len += p_len;
+
+			if (i < count - 1) {
+				strcat(cheats_path, "\n");
+				current_len += 1;
+			}
+		}
+
+		Menu_messageWithFont(cheats_path, (char*[]){"B", "返回", NULL}, font.small);
+	}
+
+	return MENU_CALLBACK_NOP;
+}
+
+int OptionPragmas_optionChanged(MenuList* list, int i) {
+	MenuItem* item = &list->items[i];
+	for (int shader_index = 0; shader_index < config.shaders.options[SH_NROFSHADERS].value; shader_index++) {
+		ShaderParam* params = PLAT_getShaderPragmas(shader_index);
+		if (!params)
+			continue;
+		for (int j = 0; j < 32; j++) {
+			if (exactMatch(params[j].name, item->key)) {
+				params[j].value = strtof(item->values[item->value], NULL);
+			}
+		}
+	}
+	// iterate the active shader count, not SH_NROFSHADERS (an enum index, 2) —
+	// this must mirror the loop that built the menu in OptionPragmas_openMenu
+	int global_index = 0;
+	for (int y = 0; y < config.shaders.options[SH_NROFSHADERS].value; y++) {
+		for (int j = 0; j < config.shaderpragmas[y].count; j++) {
+			MenuItem* item = &list->items[global_index];
+			config.shaderpragmas[y].options[j].value = item->value;
+			global_index++;
+		}
+	}
+	return MENU_CALLBACK_NOP;
+}
+
+static MenuList PragmasOptions_menu = {
+	.type = MENU_FIXED,
+	.title = "着色器设置",
+	.on_confirm = NULL,
+	.on_change = OptionPragmas_optionChanged,
+	.items = NULL};
+static int OptionPragmas_openMenu(MenuList* list, int i) {
+	int progressCount = 0;
+	int totalcount = 0;
+	for (int y = 0; y < config.shaders.options[SH_NROFSHADERS].value; y++) {
+		totalcount += config.shaderpragmas[y].count;
+	}
+	PragmasOptions_menu.items = calloc(totalcount + 1, sizeof(MenuItem));
+	// fill bound must match the allocation loop above — SH_NROFSHADERS is an
+	// enum index (2), not the shader count, and using it both overflowed the
+	// allocation and dropped shader 3's settings
+	for (int y = 0; y < config.shaders.options[SH_NROFSHADERS].value; y++) {
+		for (int j = 0; j < config.shaderpragmas[y].count; j++) {
+			MenuItem* item = &PragmasOptions_menu.items[progressCount];
+			Option* configitem = &config.shaderpragmas[y].options[j];
+			item->id = j;
+			item->name = configitem->name;
+			item->desc = configitem->desc;
+			item->value = configitem->value;
+			item->key = configitem->key;
+			item->values = configitem->values;
+			progressCount++;
+		}
+	}
+
+	if (PragmasOptions_menu.items[0].name) {
+		Menu_options(&PragmasOptions_menu);
+	} else {
+		Menu_message("未找到额外设置", (char*[]){"B", "返回", NULL});
+	}
+
+	free(PragmasOptions_menu.items);
+	PragmasOptions_menu.items = NULL;
+
+	return MENU_CALLBACK_NOP;
+}
+// Rows of a shader slot past "着色器数量" are hidden: with shaders
+// off the menu shows only the preset and the count, so a slot's file name no
+// longer looks like an active shader. Rows above the slots never move, so the
+// selection stays put when the count changes.
+static int shaderRowVisible(int opt) {
+	if (opt < SH_SHADER1)
+		return 1;
+	int slot = (opt - SH_SHADER1) / (SH_SHADER2 - SH_SHADER1) + 1;
+	return slot <= config.shaders.options[SH_NROFSHADERS].value;
+}
+// Fills items (config.shaders.count + 1 entries) with the visible rows and
+// NULL-terminates the rest; Menu_options recounts the rows every frame
+static void fillShaderItems(MenuItem* items) {
+	memset(items, 0, (config.shaders.count + 1) * sizeof(MenuItem));
+	int n = 0;
+	for (int i = 0; i < config.shaders.count; i++) {
+		if (!shaderRowVisible(i))
+			continue;
+		MenuItem* item = &items[n++];
+		Option* configitem = &config.shaders.options[i];
+		item->id = i;
+		item->name = configitem->name;
+		item->desc = configitem->desc;
+		item->value = configitem->value;
+		item->key = configitem->key;
+		item->values = configitem->values;
+		if (i == SH_EXTRASETTINGS)
+			item->on_confirm = OptionPragmas_openMenu;
+	}
+}
+int OptionShaders_optionChanged(MenuList* list, int i) {
+	MenuItem* item = &list->items[i];
+	int id = item->id;
+	// Process menu entry change, update underlying config cruft and call handler
+	Config_syncShaders(item->key, item->value);
+	// Apply shader pragmas if needed
+	applyShaderSettings();
+	// Rebuild the rows: values may have changed in the handler and the
+	// shader count decides which slots are shown
+	fillShaderItems(list->items);
+	// Recursively call Config_syncShaders again for some reason
+	if (id == SH_SHADERS_PRESET)
+		initShaders();
+	return MENU_CALLBACK_NOP;
+}
+
+static MenuList ShaderOptions_menu = {
+	.type = MENU_FIXED,
+	.title = "着色器",
+	.on_confirm = NULL,
+	.on_change = OptionShaders_optionChanged,
+	.items = NULL};
+
+int OptionShaders_openMenu(MenuList* list, int i) {
+	int filecount;
+	char shaders_glsl_dir[MAX_PATH];
+	snprintf(shaders_glsl_dir, sizeof(shaders_glsl_dir), "%s/Shaders/glsl", SDCARD_PATH);
+	char** filelist = list_files_in_folder(shaders_glsl_dir, &filecount, NULL, NULL);
+
+	// Check if folder read failed or no files found
+	if (!filelist || filecount == 0) {
+		free_file_list(filelist); // may be a non-NULL empty list
+		Menu_message("无可用着色器\n/Shaders 文件夹或着色器文件不存在", (char*[]){"B", "返回", NULL});
+		return MENU_CALLBACK_NOP;
+	}
+
+	// the three shader options share one file list (values AND labels alias
+	// it); replace it once and free the previous list, which used to leak on
+	// every menu open
+	char** old_filelist = config.shaders.options[SH_SHADER1].values;
+
+	for (int i = SH_SHADER1; i < config.shaders.count; i += SH_SHADER2 - SH_SHADER1) {
+		config.shaders.options[i].values = filelist;
+		config.shaders.options[i].labels = filelist;
+		config.shaders.options[i].count = filecount;
+	}
+	ShaderOptions_menu.items = calloc(config.shaders.count + 1, sizeof(MenuItem));
+	fillShaderItems(ShaderOptions_menu.items);
+
+	if (old_filelist && old_filelist != filelist)
+		free_file_list(old_filelist);
+
+	if (ShaderOptions_menu.items[0].name) {
+		Menu_options(&ShaderOptions_menu);
+	} else {
+		Menu_message("无可用着色器\n/Shaders 文件夹或着色器文件不存在", (char*[]){"B", "返回", NULL});
+	}
+
+	free(ShaderOptions_menu.items);
+	ShaderOptions_menu.items = NULL;
+
+	return MENU_CALLBACK_NOP;
+}

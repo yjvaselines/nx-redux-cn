@@ -1,0 +1,9 @@
+#pragma once
+
+#include <stddef.h>
+#include <stdint.h>
+
+void audio_sample_callback(int16_t left, int16_t right);
+size_t audio_sample_batch_callback(const int16_t* data, size_t frames);
+void Audio_onSinkChanged(int sink_type);
+void Audio_checkAndResetIfNeeded(void);

@@ -1,0 +1,2040 @@
+#include "ma_internal.h"
+#include "ma_emutime.h"
+#include "netplay.h"
+#include "utils.h"
+#include "arcade_names.h"
+#include "core_netplay.h"
+#include "gbalink.h"
+#include "ui_confirmdialog.h"
+#include "config.h"
+#include "ui_list.h"
+#include "ui_buttonhintbar.h"
+#include "ui_menubar.h"
+#include "ma_menu.h"
+#include "ma_present.h"
+#include "ma_frontend_opts.h"
+#include "ma_saves.h"
+#include "ma_save_paths.h"
+#include "ma_game.h"
+#include "ma_config.h"
+#include "ma_core.h"
+#include "ma_video.h"
+#include "ma_rewind.h"
+#include "minarch.h"
+#include "ra_integration.h"
+#include "ra_badges.h"
+#include "notification.h"
+#include "netplay_helper.h"
+#include <rcheevos/rc_client.h>
+#include <SDL2/SDL_image.h>
+
+// Achievement menu state (stored so on_confirm handler can access achievement data)
+static const rc_client_achievement_list_t* ach_menu_list = NULL;
+static const rc_client_achievement_t** ach_menu_achievements = NULL; // Flattened array for index lookup
+static int ach_menu_count = 0;
+static bool ach_filter_locked_only = false; // Y button toggle: show all or locked only
+
+
+#define MENU_ITEM_COUNT 5
+#define MENU_SLOT_COUNT 8
+
+enum {
+	ITEM_CONT,
+	ITEM_SAVE,
+	ITEM_LOAD,
+	ITEM_OPTS,
+	ITEM_QUIT,
+};
+
+#define MENU_MAX_DISCS 9
+
+// TODO: I don't love how overloaded this has become
+static struct {
+	SDL_Surface* bitmap;
+	SDL_Surface* overlay;
+	char* items[MENU_ITEM_COUNT];
+	char* disc_paths[MENU_MAX_DISCS]; // up to 9 paths, Arc the Lad Collection is 7 discs
+	char minui_dir[MAX_PATH];
+	char slot_path[MAX_PATH];
+	char base_path[MAX_PATH];
+	char bmp_path[MAX_PATH];
+	char txt_path[MAX_PATH];
+	int disc;
+	int total_discs;
+	int slot;
+	int save_exists;
+	int preview_exists;
+} menu = {
+	.bitmap = NULL,
+	.disc = -1,
+	.total_discs = 0,
+	.save_exists = 0,
+	.preview_exists = 0,
+
+	.items = {
+		[ITEM_CONT] = "继续",
+		[ITEM_SAVE] = "保存",
+		[ITEM_LOAD] = "载入",
+		[ITEM_OPTS] = "选项",
+		[ITEM_QUIT] = "退出",
+	}};
+
+static bool menuDiscCb(const char* disc_path, int index, void* ctx) {
+	(void)index;
+	(void)ctx;
+	if (menu.total_discs >= MENU_MAX_DISCS)
+		return false;
+	menu.disc_paths[menu.total_discs] = strdup(disc_path);
+	if (exactMatch((char*)disc_path, game.path))
+		menu.disc = menu.total_discs;
+	menu.total_discs += 1;
+	return true;
+}
+
+static void initFrontendVersionDesc(void);
+
+void Menu_init(void) {
+	initFrontendVersionDesc();
+	// A crash during bind capture can leave the OSD suppress flag behind;
+	// /tmp survives until reboot, so clear it on every launch
+	unlink(OSD_SUPPRESS_PATH);
+
+	menu.overlay = SDL_CreateRGBSurfaceWithFormat(SDL_SWSURFACE,
+												  DEVICE_WIDTH, DEVICE_HEIGHT,
+												  screen->format->BitsPerPixel, screen->format->format);
+	SDL_SetSurfaceBlendMode(menu.overlay, SDL_BLENDMODE_BLEND);
+	Uint32 color = SDL_MapRGBA(menu.overlay->format, 0, 0, 0, 0);
+	SDL_FillRect(screen, NULL, color);
+
+	char emu_name[MAX_PATH]; // getEmuName requires MAX_PATH buffers
+	getEmuName(game.path, emu_name);
+	// A netplay client on the host's save keeps its slot markers beside its
+	// isolated states (see Core_open), so NextUI never lists them as its own.
+	const char* netplay_saves = getenv("NETPLAY_SAVES_DIR");
+	if (netplay_saves && netplay_saves[0]) {
+		snprintf(menu.minui_dir, sizeof(menu.minui_dir), "%s/minui", netplay_saves);
+		mkdir_p(menu.minui_dir);
+	} else {
+		snprintf(menu.minui_dir, sizeof(menu.minui_dir), "%s/.minui/%s", SHARED_USERDATA_PATH, emu_name);
+		mkdir(menu.minui_dir, 0755);
+	}
+
+	// always sanitized/outer name, to keep main UI from having to inspect archives
+	snprintf(menu.slot_path, sizeof(menu.slot_path), "%s/%s.txt", menu.minui_dir, game.name);
+
+	if (simple_mode)
+		menu.items[ITEM_OPTS] = "重置";
+
+	if (game.m3u_path[0]) {
+		strcpy(menu.base_path, game.m3u_path);
+		char* tmp = strrchr(menu.base_path, '/');
+		if (tmp)
+			tmp[1] = '\0';
+		M3U_forEachDisc(game.m3u_path, menuDiscCb, NULL);
+	}
+}
+void Menu_quit(void) {
+	SDL_FreeSurface(menu.overlay);
+	for (int i = 0; i < menu.total_discs; i++) {
+		free(menu.disc_paths[i]);
+		menu.disc_paths[i] = NULL;
+	}
+	menu.total_discs = 0;
+}
+void Menu_beforeSleep() {
+	SRAM_write();
+	RTC_write();
+	if (Multiplayer_isActive()) {
+		// No state, no auto-resume: a netplay session can't be resumed, and
+		// serializing flycast stops its emulator, which silently ends GGPO.
+		// Sleeping (or powering off) in a core-run session is leaving it: tell
+		// the other player now, and quit to the list on wake.
+		if (CoreNetplay_isActive()) {
+			CoreNetplay_byeSend(CORE_NETPLAY_BYE_PORT);
+			quit = 1;
+		}
+	} else {
+		State_autosave();
+		// a netplay client's autosave holds the host's data in /tmp: nothing
+		// NextUI should resume into
+		if (prefixMatch(SDCARD_PATH, game.path) && Menu_netplaySavesMode() != NETPLAY_SAVES_COPY)
+			putFile(AUTO_RESUME_PATH, game.path + strlen(SDCARD_PATH));
+	}
+
+	PWR_setCPUSpeed(CPU_SPEED_MENU);
+}
+NetplaySavesMode Menu_netplaySavesMode(void) {
+	return SavePaths_netplayMode(getenv("NETPLAY_ROLE"), getenv("NETPLAY_SAVES_DIR"));
+}
+// A session on the device's own save (link sessions, the lockstep host) writes
+// that save but never an auto-resume state, so the one from before the session
+// would resume the game to before it, and the next in-game save would then
+// undo the session (a trade, say). Drop it, and the markers that point at it,
+// as the session starts so a crash or flat battery mid-session is covered too.
+// Manual slots (0-8) are never touched.
+void Menu_dropAutoResumeForSession(void) {
+	if (Menu_netplaySavesMode() != NETPLAY_SAVES_REAL)
+		return;
+
+	char removed[MAX_PATH] = "";
+	char path[MAX_PATH];
+	// a truncated path could name a manual slot: leave the state alone then
+	if (State_getSlotPath(AUTO_RESUME_SLOT, path) != 0)
+		LOG_error("Netplay: auto-resume state path too long for %s, state kept\n", game.name);
+	else if (unlink(path) == 0)
+		strcat(removed, " state");
+	snprintf(path, sizeof(path), "%s/%s.%d.bmp", menu.minui_dir, game.name, AUTO_RESUME_SLOT);
+	if (unlink(path) == 0)
+		strcat(removed, " preview");
+	snprintf(path, sizeof(path), "%s/%s.%d.txt", menu.minui_dir, game.name, AUTO_RESUME_SLOT);
+	if (unlink(path) == 0)
+		strcat(removed, " disc-marker");
+	// the RESUME slot file only when it points at the auto slot just removed
+	if (exists(menu.slot_path) && getInt(menu.slot_path) == AUTO_RESUME_SLOT && unlink(menu.slot_path) == 0)
+		strcat(removed, " slot-file");
+	if (exists(AUTO_RESUME_PATH)) {
+		char marker[MAX_PATH];
+		getFile(AUTO_RESUME_PATH, marker, sizeof(marker));
+		if (SavePaths_autoResumeIsGame(marker, game.path, SDCARD_PATH) && unlink(AUTO_RESUME_PATH) == 0)
+			strcat(removed, " auto_resume.txt");
+	}
+	LOG_info("Netplay: session on the real save, dropped auto-resume for %s:%s\n", game.name, removed[0] ? removed : " (none)");
+}
+void Menu_afterSleep() {
+	// a netplay client never writes it (Menu_beforeSleep), so never drops it
+	if (Menu_netplaySavesMode() != NETPLAY_SAVES_COPY)
+		unlink(AUTO_RESUME_PATH);
+	setOverclock(overclock);
+	EmuTime_reset();
+}
+static int ach_compare_unlocked_first(const void* a, const void* b) {
+	const rc_client_achievement_t* achA = *(const rc_client_achievement_t**)a;
+	const rc_client_achievement_t* achB = *(const rc_client_achievement_t**)b;
+	// Unlocked achievements come first
+	if (achA->unlocked != achB->unlocked)
+		return achB->unlocked - achA->unlocked;
+	return 0;
+}
+
+// Sort entry: `ach` is the first member, so the comparators below that take a
+// `const rc_client_achievement_t**` read it straight from an entry pointer.
+typedef struct {
+	const rc_client_achievement_t* ach;
+	uint32_t subset; // ordinal of the achievement's subset in the list
+} AchSortEntry;
+
+static int ach_compare_display_first(const void* a, const void* b) {
+	const AchSortEntry* A = (const AchSortEntry*)a;
+	const AchSortEntry* B = (const AchSortEntry*)b;
+	// Display order is the server's list order (IDs follow creation, not order). rc_client keeps each
+	// subset's achievements in one array in that order and the list points into it, so within a
+	// subset the address is the position.
+	if (A->subset != B->subset)
+		return A->subset < B->subset ? -1 : 1;
+	if (A->ach != B->ach)
+		return (uintptr_t)A->ach < (uintptr_t)B->ach ? -1 : 1;
+	return 0;
+}
+
+static int ach_compare_display_last(const void* a, const void* b) {
+	return -ach_compare_display_first(a, b);
+}
+
+static int ach_compare_won_by_most(const void* a, const void* b) {
+	const rc_client_achievement_t* achA = *(const rc_client_achievement_t**)a;
+	const rc_client_achievement_t* achB = *(const rc_client_achievement_t**)b;
+	// Higher rarity (more common) first
+	if (achA->rarity != achB->rarity)
+		return (achB->rarity - achA->rarity) > 0 ? 1 : -1;
+	return 0;
+}
+
+static int ach_compare_won_by_least(const void* a, const void* b) {
+	return -ach_compare_won_by_most(a, b);
+}
+
+static int ach_compare_points_most(const void* a, const void* b) {
+	const rc_client_achievement_t* achA = *(const rc_client_achievement_t**)a;
+	const rc_client_achievement_t* achB = *(const rc_client_achievement_t**)b;
+	return (int)achB->points - (int)achA->points;
+}
+
+static int ach_compare_points_least(const void* a, const void* b) {
+	return -ach_compare_points_most(a, b);
+}
+
+static int ach_compare_title_az(const void* a, const void* b) {
+	const rc_client_achievement_t* achA = *(const rc_client_achievement_t**)a;
+	const rc_client_achievement_t* achB = *(const rc_client_achievement_t**)b;
+	return strcmp(achA->title, achB->title);
+}
+
+static int ach_compare_title_za(const void* a, const void* b) {
+	return -ach_compare_title_az(a, b);
+}
+
+static int ach_compare_type_asc(const void* a, const void* b) {
+	const rc_client_achievement_t* achA = *(const rc_client_achievement_t**)a;
+	const rc_client_achievement_t* achB = *(const rc_client_achievement_t**)b;
+	return (int)achA->type - (int)achB->type;
+}
+
+static int ach_compare_type_desc(const void* a, const void* b) {
+	return -ach_compare_type_asc(a, b);
+}
+
+static void ach_sort_achievements(AchSortEntry* entries, int count) {
+	int sort_order = CFG_getRAAchievementSortOrder();
+	int (*compare)(const void*, const void*) = NULL;
+
+	switch (sort_order) {
+	case RA_SORT_UNLOCKED_FIRST:
+		compare = ach_compare_unlocked_first;
+		break;
+	case RA_SORT_DISPLAY_ORDER_FIRST:
+		compare = ach_compare_display_first;
+		break;
+	case RA_SORT_DISPLAY_ORDER_LAST:
+		compare = ach_compare_display_last;
+		break;
+	case RA_SORT_WON_BY_MOST:
+		compare = ach_compare_won_by_most;
+		break;
+	case RA_SORT_WON_BY_LEAST:
+		compare = ach_compare_won_by_least;
+		break;
+	case RA_SORT_POINTS_MOST:
+		compare = ach_compare_points_most;
+		break;
+	case RA_SORT_POINTS_LEAST:
+		compare = ach_compare_points_least;
+		break;
+	case RA_SORT_TITLE_AZ:
+		compare = ach_compare_title_az;
+		break;
+	case RA_SORT_TITLE_ZA:
+		compare = ach_compare_title_za;
+		break;
+	case RA_SORT_TYPE_ASC:
+		compare = ach_compare_type_asc;
+		break;
+	case RA_SORT_TYPE_DESC:
+		compare = ach_compare_type_desc;
+		break;
+	default:
+		compare = ach_compare_unlocked_first;
+		break;
+	}
+
+	if (compare && count > 1) {
+		qsort(entries, count, sizeof(AchSortEntry), compare);
+	}
+}
+
+static int OptionAchievements_showDetail(MenuList* list, int i) {
+	if (!ach_menu_achievements || i < 0 || i >= ach_menu_count) {
+		return MENU_CALLBACK_NOP;
+	}
+
+	const rc_client_achievement_t* ach = ach_menu_achievements[i];
+	if (!ach || !ach->title) {
+		return MENU_CALLBACK_NOP;
+	}
+
+	GFX_setMode(MODE_MAIN);
+	bool dirty = true;
+	int show_detail = 1;
+
+	// Content renders onto this transparent canvas first so its total height
+	// is known, then the canvas is blitted vertically centered on screen.
+	SDL_Surface* detail_canvas = SDL_CreateRGBSurfaceWithFormat(
+		0, screen->w, screen->h, 32, SDL_PIXELFORMAT_ARGB8888);
+	if (!detail_canvas) {
+		GFX_setMode(MODE_MENU);
+		return i;
+	}
+
+	while (show_detail) {
+		GFX_startFrame();
+		PAD_poll();
+
+		// Check for input
+		if (PAD_justPressed(BTN_B)) {
+			show_detail = 0;
+		} else if (PAD_justPressed(BTN_X)) {
+			// Toggle mute for this achievement
+			RA_toggleAchievementMute(ach->id);
+			dirty = true;
+		} else if (PAD_justPressed(BTN_LEFT) || PAD_justRepeated(BTN_LEFT)) {
+			// Navigate to previous achievement (with wrap-around)
+			i = (i - 1 + ach_menu_count) % ach_menu_count;
+			ach = ach_menu_achievements[i];
+			dirty = true;
+		} else if (PAD_justPressed(BTN_RIGHT) || PAD_justRepeated(BTN_RIGHT)) {
+			// Navigate to next achievement (with wrap-around)
+			i = (i + 1) % ach_menu_count;
+			ach = ach_menu_achievements[i];
+			dirty = true;
+		}
+
+		PWR_update(&dirty, NULL, Menu_beforeSleep, Menu_afterSleep);
+
+		if (dirty) {
+			bool is_muted = RA_isAchievementMuted(ach->id);
+
+			GFX_clear(screen);
+			SDL_FillRect(detail_canvas, NULL,
+						 SDL_MapRGBA(detail_canvas->format, 0, 0, 0, 0));
+
+			// Layout: badge icon centered at top, then title, then details.
+			// Everything is drawn onto the canvas starting at y=0; once the
+			// total height is known the canvas is centered vertically.
+			int badge_size = SCALE1(64); // 64px badge
+			int content_y = 0;
+			int center_x = detail_canvas->w / 2;
+
+			// Badge icon centered at top
+			SDL_Surface* badge = RA_Badges_get(RA_getGameId(), ach->badge_name, !ach->unlocked);
+			if (badge) {
+				SDL_Rect badge_src = {0, 0, badge->w, badge->h};
+				SDL_Rect badge_dst = {
+					center_x - badge_size / 2,
+					content_y,
+					badge_size, badge_size};
+				SDL_BlitScaled(badge, &badge_src, detail_canvas, &badge_dst);
+				content_y += badge_size + SCALE1(6);
+			}
+
+			// Title centered - wrap to max 2 lines with ellipsis if needed.
+			// Wider side margins (3x PADDING each side) keep long wrapped
+			// descriptions from hugging the screen edges.
+			int max_text_width = screen->w - SCALE1(PADDING * 6);
+			content_y = GFX_blitWrappedText(font.medium, ach->title, max_text_width, 2, COLOR_WHITE, detail_canvas, content_y);
+			content_y += SCALE1(2); // Spacing after title
+
+			// Description - unlimited lines
+			content_y = GFX_blitWrappedText(font.small, ach->description, max_text_width, 0, COLOR_WHITE, detail_canvas, content_y);
+			content_y += SCALE1(4); // Spacing after description
+
+			// Points (singular/plural) - use tiny font like other metadata
+			char points_str[32];
+			if (ach->points == 1) {
+				snprintf(points_str, sizeof(points_str), "1 分");
+			} else {
+				snprintf(points_str, sizeof(points_str), "%u 分", ach->points);
+			}
+			SDL_Surface* points_text = GFX_renderText(font.tiny, points_str, COLOR_LIGHT_TEXT);
+			if (points_text) {
+				SDL_BlitSurface(points_text, NULL, detail_canvas, &(SDL_Rect){center_x - points_text->w / 2, content_y});
+				content_y += points_text->h + SCALE1(2);
+				SDL_FreeSurface(points_text);
+			}
+
+			// Unlock time or progress (smaller font, gray)
+			if (ach->unlocked && ach->unlock_time > 0) {
+				struct tm* tm_info = localtime(&ach->unlock_time);
+				char time_buf[64];
+				strftime(time_buf, sizeof(time_buf), "解锁于 %B %d %Y, %I:%M%p", tm_info);
+				SDL_Surface* time_text = GFX_renderText(font.tiny, time_buf, COLOR_LIGHT_TEXT);
+				if (time_text) {
+					SDL_BlitSurface(time_text, NULL, detail_canvas, &(SDL_Rect){center_x - time_text->w / 2, content_y});
+					content_y += time_text->h + SCALE1(2);
+					SDL_FreeSurface(time_text);
+				}
+			} else if (ach->measured_progress[0]) {
+				char progress_buf[64];
+				snprintf(progress_buf, sizeof(progress_buf), "进度：%s", ach->measured_progress);
+				SDL_Surface* progress_text = GFX_renderText(font.tiny, progress_buf, COLOR_LIGHT_TEXT);
+				if (progress_text) {
+					SDL_BlitSurface(progress_text, NULL, detail_canvas, &(SDL_Rect){center_x - progress_text->w / 2, content_y});
+					content_y += progress_text->h + SCALE1(2);
+					SDL_FreeSurface(progress_text);
+				}
+			}
+
+			// Unlock rate/rarity (smaller font, gray)
+			if (ach->rarity > 0) {
+				char rarity_buf[32];
+				snprintf(rarity_buf, sizeof(rarity_buf), "%.2f%% 解锁率", ach->rarity);
+				SDL_Surface* rarity_text = GFX_renderText(font.tiny, rarity_buf, COLOR_LIGHT_TEXT);
+				if (rarity_text) {
+					SDL_BlitSurface(rarity_text, NULL, detail_canvas, &(SDL_Rect){center_x - rarity_text->w / 2, content_y});
+					content_y += rarity_text->h + SCALE1(2);
+					SDL_FreeSurface(rarity_text);
+				}
+			}
+
+			// Type tag
+			const char* type_str = NULL;
+			switch (ach->type) {
+			case RC_CLIENT_ACHIEVEMENT_TYPE_MISSABLE:
+				type_str = "[易错过]";
+				break;
+			case RC_CLIENT_ACHIEVEMENT_TYPE_PROGRESSION:
+				type_str = "[进度]";
+				break;
+			case RC_CLIENT_ACHIEVEMENT_TYPE_WIN:
+				type_str = "[胜利条件]";
+				break;
+			default:
+				break;
+			}
+			if (type_str) {
+				SDL_Surface* type_text = GFX_renderText(font.tiny, type_str, COLOR_LIGHT_TEXT);
+				if (type_text) {
+					SDL_BlitSurface(type_text, NULL, detail_canvas, &(SDL_Rect){center_x - type_text->w / 2, content_y});
+					content_y += type_text->h + SCALE1(2);
+					SDL_FreeSurface(type_text);
+				}
+			}
+
+			// Muted status below other info with gap before title
+			if (is_muted) {
+				SDL_Surface* mute_text = GFX_renderText(font.tiny, "已静音：不会显示通知", COLOR_LIGHT_TEXT);
+				if (mute_text) {
+					SDL_BlitSurface(mute_text, NULL, detail_canvas, &(SDL_Rect){center_x - mute_text->w / 2, content_y + SCALE1(4)});
+					content_y += SCALE1(4) + mute_text->h;
+					SDL_FreeSurface(mute_text);
+				}
+			}
+
+			// Blit the finished block vertically centered between the top of
+			// the screen and the button hint bar
+			{
+				int avail_h = screen->h - SCALE1(PADDING + BUTTON_SIZE + BUTTON_MARGIN);
+				int dest_y = (avail_h - content_y) / 2;
+				if (dest_y < SCALE1(PADDING))
+					dest_y = SCALE1(PADDING);
+				SDL_BlitSurface(detail_canvas,
+								&(SDL_Rect){0, 0, detail_canvas->w, content_y},
+								screen, &(SDL_Rect){0, dest_y});
+			}
+
+			// Button hints - update based on current mute state
+			char* hints[] = {"B", "返回", "X", is_muted ? "取消静音" : "静音", NULL};
+			UI_renderButtonHintBar(screen, hints);
+			GFX_flip(screen);
+			dirty = false;
+		}
+
+		hdmimon();
+	}
+
+	SDL_FreeSurface(detail_canvas);
+	GFX_setMode(MODE_MENU);
+	// Return the current index so caller can update selection
+	return i;
+}
+
+static int OptionAchievements_openMenu(MenuList* list, int i) {
+	if (!RA_isGameLoaded()) {
+		if (RA_isGameUnknown())
+			Menu_message("RetroAchievements 无法识别该游戏文件。\n请使用 retroachievements.org 上\n列出的受支持版本。", (char*[]){"B", "返回", NULL});
+		else
+			Menu_message("未加载游戏，无法显示成就", (char*[]){"B", "返回", NULL});
+		return MENU_CALLBACK_NOP;
+	}
+
+	uint32_t unlocked, total;
+	RA_getAchievementSummary(&unlocked, &total);
+
+	if (total == 0) {
+		Menu_message("这个游戏还没有成就", (char*[]){"B", "返回", NULL});
+		return MENU_CALLBACK_NOP;
+	}
+
+	// Clean up any previous achievement list
+	if (ach_menu_list) {
+		RA_destroyAchievementList(ach_menu_list);
+		ach_menu_list = NULL;
+	}
+	if (ach_menu_achievements) {
+		free(ach_menu_achievements);
+		ach_menu_achievements = NULL;
+	}
+	ach_menu_count = 0;
+
+	// Create achievement list grouped by lock state
+	ach_menu_list = (const rc_client_achievement_list_t*)RA_createAchievementList(
+		RC_CLIENT_ACHIEVEMENT_CATEGORY_CORE, RC_CLIENT_ACHIEVEMENT_LIST_GROUPING_LOCK_STATE);
+
+	if (!ach_menu_list) {
+		Menu_message("加载成就失败", (char*[]){"B", "返回", NULL});
+		return MENU_CALLBACK_NOP;
+	}
+
+	// Count total achievements across all buckets and build flattened array
+	int total_achievements = 0;
+	for (uint32_t b = 0; b < ach_menu_list->num_buckets; b++) {
+		total_achievements += ach_menu_list->buckets[b].num_achievements;
+	}
+
+	if (total_achievements == 0) {
+		RA_destroyAchievementList(ach_menu_list);
+		ach_menu_list = NULL;
+		// This can happen with unsupported game versions where pseudo-achievements
+		// are counted in the summary but not available in the achievement list
+		Menu_message("成就列表不可用", (char*[]){"B", "返回", NULL});
+		return MENU_CALLBACK_NOP;
+	}
+
+	// Create flattened array of all achievement pointers
+	const rc_client_achievement_t** all_achievements = calloc(total_achievements, sizeof(rc_client_achievement_t*));
+	AchSortEntry* sort_entries = calloc(total_achievements, sizeof(AchSortEntry));
+	int idx = 0;
+	uint32_t subset = 0;
+	for (uint32_t b = 0; b < ach_menu_list->num_buckets && idx < total_achievements; b++) {
+		const rc_client_achievement_bucket_t* bucket = &ach_menu_list->buckets[b];
+		// buckets come subset by subset (subset_id is 0 when the game has only one)
+		if (b > 0 && bucket->subset_id != ach_menu_list->buckets[b - 1].subset_id)
+			subset++;
+		for (uint32_t a = 0; a < bucket->num_achievements && idx < total_achievements; a++) {
+			sort_entries[idx].ach = bucket->achievements[a];
+			sort_entries[idx++].subset = subset;
+		}
+	}
+
+	// Sort achievements according to settings
+	ach_sort_achievements(sort_entries, idx);
+	for (int j = 0; j < idx; j++)
+		all_achievements[j] = sort_entries[j].ach;
+	free(sort_entries);
+
+	// Custom menu loop with X (mute) and Y (filter) support
+	bool dirty = true;
+	bool filter_dirty = true; // Rebuild filtered list when this is set
+	int show_menu = 1;
+	int selected = 0;
+	int start = 0;
+	int max_visible = (screen->h - ((SCALE1(PADDING + PILL_SIZE) * 2) + SCALE1(BUTTON_SIZE))) / SCALE1(BUTTON_SIZE);
+
+	// Allocate filtered array once (max size = all achievements)
+	const rc_client_achievement_t** filtered = calloc(total_achievements, sizeof(rc_client_achievement_t*));
+	int filtered_count = 0;
+
+	// Hide the "未知模拟器" warning when hardcore mode is disabled.
+	// Show it when enabled so users understand why they only get softcore unlocks.
+	// Note: We intentionally show "不支持的版本" so users know to find a supported ROM.
+	bool hide_unknown_emulator = !CFG_getRAHardcoreMode();
+
+	while (show_menu) {
+		GFX_startFrame();
+		PAD_poll();
+
+		// Rebuild filtered list only when filter changes
+		if (filter_dirty) {
+			filtered_count = 0;
+			for (int j = 0; j < total_achievements; j++) {
+				// Skip "未知模拟器" warning when hardcore mode is disabled
+				if (hide_unknown_emulator && all_achievements[j]->id == RA_UNKNOWN_EMULATOR_ACHIEVEMENT_ID) {
+					continue;
+				}
+				if (!ach_filter_locked_only || !all_achievements[j]->unlocked) {
+					filtered[filtered_count++] = all_achievements[j];
+				}
+			}
+
+			if (filtered_count == 0) {
+				if (ach_filter_locked_only) {
+					// No locked achievements when filter is on - revert filter
+					ach_filter_locked_only = false;
+					continue; // Will rebuild with filter off
+				}
+				// No achievements at all after filtering - exit menu
+				free(all_achievements);
+				free(filtered);
+				RA_destroyAchievementList(ach_menu_list);
+				ach_menu_list = NULL;
+				ach_menu_achievements = NULL;
+				ach_menu_count = 0;
+				Menu_message("未找到成就", (char*[]){"B", "返回", NULL});
+				return MENU_CALLBACK_NOP;
+			}
+
+			// Store for detail view
+			ach_menu_achievements = filtered;
+			ach_menu_count = filtered_count;
+
+			// Reset scroll position when filter changes
+			if (selected >= filtered_count)
+				selected = filtered_count - 1;
+			if (selected < 0)
+				selected = 0;
+			start = 0;
+
+			filter_dirty = false;
+			dirty = true;
+		}
+
+		int end = MIN(start + max_visible, filtered_count);
+
+		if (PAD_justRepeated(BTN_UP)) {
+			selected--;
+			if (selected < 0) {
+				selected = filtered_count - 1;
+				start = MAX(0, filtered_count - max_visible);
+			} else if (selected < start) {
+				start--;
+			}
+			dirty = true;
+		} else if (PAD_justRepeated(BTN_DOWN)) {
+			selected++;
+			if (selected >= filtered_count) {
+				selected = 0;
+				start = 0;
+			} else if (selected >= end) {
+				start++;
+			}
+			dirty = true;
+		} else if (PAD_justRepeated(BTN_LEFT)) {
+			// Page up (move up by max_visible items)
+			selected -= max_visible;
+			if (selected < 0) {
+				selected = 0;
+				start = 0;
+			} else {
+				start = selected;
+			}
+			dirty = true;
+		} else if (PAD_justRepeated(BTN_RIGHT)) {
+			// Page down (move down by max_visible items)
+			selected += max_visible;
+			if (selected >= filtered_count) {
+				selected = filtered_count - 1;
+				start = MAX(0, filtered_count - max_visible);
+			} else {
+				start = selected;
+			}
+			dirty = true;
+		} else if (PAD_justPressed(BTN_B)) {
+			show_menu = 0;
+		} else if (PAD_justPressed(BTN_A)) {
+			// Show detail view (returns updated index after navigation)
+			selected = OptionAchievements_showDetail(NULL, selected);
+			// Adjust scroll position if needed
+			if (selected < start) {
+				start = selected;
+			} else if (selected >= start + max_visible) {
+				start = selected - max_visible + 1;
+			}
+			dirty = true;
+		} else if (PAD_justPressed(BTN_X)) {
+			// Toggle mute for selected achievement
+			if (filtered_count > 0) {
+				const rc_client_achievement_t* ach = filtered[selected];
+				RA_toggleAchievementMute(ach->id);
+				dirty = true;
+			}
+		} else if (PAD_justPressed(BTN_Y)) {
+			// Toggle filter: All <-> Locked Only
+			ach_filter_locked_only = !ach_filter_locked_only;
+			selected = 0;
+			start = 0;
+			filter_dirty = true;
+		}
+
+		if (dirty) {
+			end = MIN(start + max_visible, filtered_count);
+
+			GFX_clear(screen);
+			GFX_blitHardwareGroup(screen, 0);
+
+			// Layout constants matching MENU_FIXED style
+			int mw = screen->w - SCALE1(PADDING * 2);
+			int ox = SCALE1(PADDING);
+			int row_height = SCALE1(BUTTON_SIZE);
+			int selected_row = selected - start;
+			int opt_pad = SCALE1(8); // Local option padding
+
+			// Status text at top, aligned with hardware pill (not part of centered content)
+			char status_text[64];
+			snprintf(status_text, sizeof(status_text), "%u/%u 已解锁", unlocked, total);
+			SDL_Surface* status_surface = GFX_renderText(font.tiny, status_text, COLOR_WHITE);
+			if (status_surface) {
+				SDL_BlitSurface(status_surface, NULL, screen, &(SDL_Rect){
+																  (screen->w - status_surface->w) / 2,
+																  SCALE1(PADDING) + (SCALE1(PILL_SIZE) - status_surface->h) / 2 // Vertically centered with pill
+															  });
+				SDL_FreeSurface(status_surface);
+			}
+
+			// Calculate vertical centering for list only
+			int top_margin = SCALE1(PADDING + PILL_SIZE);	 // Below hardware pill / status text
+			int bottom_margin = SCALE1(PADDING + PILL_SIZE); // Above button hints
+			int available_height = screen->h - top_margin - bottom_margin;
+
+			// Content: just the visible rows
+			int visible_rows = MIN(end - start, filtered_count);
+			int list_height = visible_rows * row_height;
+
+			// Center list vertically in available space
+			int oy = top_margin + (available_height - list_height) / 2;
+
+			// Draw achievement list rows
+			for (int j = start, row = 0; j < end && j < filtered_count; j++, row++) {
+				const rc_client_achievement_t* ach = filtered[j];
+				bool is_muted = RA_isAchievementMuted(ach->id);
+				bool is_selected = (row == selected_row);
+				SDL_Color text_color = COLOR_WHITE;
+
+				if (is_selected) {
+					// Gray pill background for full row width (like MENU_FIXED selected)
+					GFX_blitPillLight(ASSET_BUTTON, screen, &(SDL_Rect){ox, oy + SCALE1(row * BUTTON_SIZE), mw, row_height});
+				}
+
+				// Draw ">" on the right side (always white)
+				SDL_Surface* arrow = GFX_renderText(font.small, ">", COLOR_WHITE);
+				if (arrow) {
+					SDL_BlitSurface(arrow, NULL, screen, &(SDL_Rect){ox + mw - arrow->w - opt_pad, oy + SCALE1((row * BUTTON_SIZE) + 3)});
+					SDL_FreeSurface(arrow);
+				}
+
+				if (is_selected) {
+					// White pill for the text area with icon (like MENU_FIXED selected text pill)
+					// Calculate width needed for: badge + spacing + title + mute indicator + padding
+					int badge_display_size = SCALE1(BUTTON_SIZE - 4); // Badge sized to fit in row
+					int title_width = 0;
+					GFX_measureText(font.small, ach->title, &title_width, NULL);
+					int mute_width = 0;
+					if (is_muted) {
+						GFX_measureText(font.tiny, "[M]", &mute_width, NULL);
+						mute_width += SCALE1(4); // spacing
+					}
+					int pill_width = opt_pad + badge_display_size + SCALE1(6) + title_width + mute_width + opt_pad;
+
+					GFX_blitPillDark(ASSET_BUTTON, screen, &(SDL_Rect){ox, oy + SCALE1(row * BUTTON_SIZE), pill_width, row_height});
+					text_color = uintToColour(THEME_COLOR5_255);
+
+					// Badge icon inside the white pill
+					SDL_Surface* badge = RA_Badges_get(RA_getGameId(), ach->badge_name, !ach->unlocked);
+					if (badge) {
+						SDL_Rect badge_src = {0, 0, badge->w, badge->h};
+						SDL_Rect badge_dst = {
+							ox + opt_pad,
+							oy + SCALE1(row * BUTTON_SIZE) + (row_height - badge_display_size) / 2,
+							badge_display_size, badge_display_size};
+						SDL_BlitScaled(badge, &badge_src, screen, &badge_dst);
+					}
+
+					// Title text
+					SDL_Surface* title_text = GFX_renderText(font.small, ach->title, text_color);
+					if (title_text) {
+						SDL_BlitSurface(title_text, NULL, screen, &(SDL_Rect){ox + opt_pad + badge_display_size + SCALE1(6), oy + SCALE1((row * BUTTON_SIZE) + 1)});
+						SDL_FreeSurface(title_text);
+					}
+
+					// Mute indicator inside the pill
+					if (is_muted) {
+						SDL_Surface* mute_text = GFX_renderText(font.tiny, "[M]", text_color);
+						if (mute_text) {
+							SDL_BlitSurface(mute_text, NULL, screen, &(SDL_Rect){ox + opt_pad + badge_display_size + SCALE1(6) + title_width + SCALE1(4), oy + SCALE1((row * BUTTON_SIZE) + 3)});
+							SDL_FreeSurface(mute_text);
+						}
+					}
+				} else {
+					// Unselected row - just badge + title + mute indicator, no pills
+					int badge_display_size = SCALE1(BUTTON_SIZE - 4);
+
+					// Badge icon
+					SDL_Surface* badge = RA_Badges_get(RA_getGameId(), ach->badge_name, !ach->unlocked);
+					if (badge) {
+						SDL_Rect badge_src = {0, 0, badge->w, badge->h};
+						SDL_Rect badge_dst = {
+							ox + opt_pad,
+							oy + SCALE1(row * BUTTON_SIZE) + (row_height - badge_display_size) / 2,
+							badge_display_size, badge_display_size};
+						SDL_BlitScaled(badge, &badge_src, screen, &badge_dst);
+					}
+
+					// Title text (theme color for unselected)
+					SDL_Surface* title_text = GFX_renderText(font.small, ach->title, COLOR_WHITE);
+					if (title_text) {
+						SDL_BlitSurface(title_text, NULL, screen, &(SDL_Rect){ox + opt_pad + badge_display_size + SCALE1(6), oy + SCALE1((row * BUTTON_SIZE) + 1)});
+						SDL_FreeSurface(title_text);
+					}
+
+					// Mute indicator
+					if (is_muted) {
+						SDL_Surface* mute_text = GFX_renderText(font.tiny, "[M]", COLOR_WHITE);
+						if (mute_text) {
+							int title_width = 0;
+							GFX_measureText(font.small, ach->title, &title_width, NULL);
+							SDL_BlitSurface(mute_text, NULL, screen, &(SDL_Rect){ox + opt_pad + badge_display_size + SCALE1(6) + title_width + SCALE1(4), oy + SCALE1((row * BUTTON_SIZE) + 3)});
+							SDL_FreeSurface(mute_text);
+						}
+					}
+				}
+			}
+
+			// Button hints at bottom with dynamic Y button text
+			char* hints[] = {"Y", ach_filter_locked_only ? "显示全部" : "显示未解锁", "X", "静音", NULL};
+			UI_renderButtonHintBar(screen, hints);
+
+			GFX_flip(screen);
+			dirty = false;
+		}
+	}
+
+	// Cleanup
+	free(all_achievements);
+	free(filtered); // This was assigned to ach_menu_achievements
+	ach_menu_achievements = NULL;
+	ach_menu_count = 0;
+	if (ach_menu_list) {
+		RA_destroyAchievementList(ach_menu_list);
+		ach_menu_list = NULL;
+	}
+
+	return MENU_CALLBACK_NOP;
+}
+
+// Frontend hint: the release tag ("NX Redux (v1.8.0)") when version.txt has
+// one, otherwise the compiled-in date+hash that identifies dev builds.
+static char frontend_version_desc[64] = "NX Redux (" BUILD_DATE " " BUILD_HASH ")";
+static void initFrontendVersionDesc(void) {
+	char version_path[MAX_PATH];
+	snprintf(version_path, sizeof(version_path), "%sversion.txt", ROOT_SYSTEM_PATH);
+	FILE* f = fopen(version_path, "r");
+	if (!f)
+		return;
+	char line[64];
+	char tag[64] = {0};
+	int line_num = 0;
+	while (fgets(line, sizeof(line), f) && line_num < 3) {
+		line_num++;
+		if (line_num == 3) {
+			int len = (int)strlen(line);
+			while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r'))
+				line[--len] = '\0';
+			strncpy(tag, line, sizeof(tag) - 1);
+		}
+	}
+	fclose(f);
+	if (tag[0] && strcmp(tag, "untagged") != 0)
+		snprintf(frontend_version_desc, sizeof(frontend_version_desc), "NX Redux (%s)", tag);
+}
+
+// options_menu index of Achievements (Save Changes follows it, or takes its
+// place while RA is off)
+#define OPTIONS_RA_INDEX 5
+static MenuList options_menu = {
+	.type = MENU_LIST,
+	.title = "选项",
+	.items = (MenuItem[]){
+		{"前端", frontend_version_desc, .on_confirm = OptionFrontend_openMenu},
+		// Core options that apply without a core restart; the full set (incl.
+		// restart-only options) lives in the pre-launch editor (options.elf)
+		{"核心选项", (char*)core.version, .on_confirm = OptionEmulator_openMenu},
+		{"着色器", .on_confirm = OptionShaders_openMenu},
+		{"作弊码", .on_confirm = OptionCheats_openMenu},
+		{"按键设置", .on_confirm = OptionControls_openMenu},
+		{"成就", .on_confirm = OptionAchievements_openMenu},
+		{"保存更改", .on_confirm = OptionSaveChanges_openMenu},
+		{NULL},
+		{NULL},
+	}};
+
+// Track the index of Save Changes menu item (changes based on RA visibility)
+static int save_changes_index = OPTIONS_RA_INDEX + 1;
+
+// Update options menu visibility based on RA enable state
+void Options_updateVisibility(void) {
+	if (CFG_getRAEnable()) {
+		// RA enabled: Achievements, then Save Changes
+		options_menu.items[OPTIONS_RA_INDEX].name = "成就";
+		options_menu.items[OPTIONS_RA_INDEX].on_confirm = OptionAchievements_openMenu;
+		options_menu.items[OPTIONS_RA_INDEX + 1].name = "保存更改";
+		options_menu.items[OPTIONS_RA_INDEX + 1].on_confirm = OptionSaveChanges_openMenu;
+		save_changes_index = OPTIONS_RA_INDEX + 1;
+	} else {
+		// RA disabled: hide Achievements, move Save Changes up
+		options_menu.items[OPTIONS_RA_INDEX].name = "保存更改";
+		options_menu.items[OPTIONS_RA_INDEX].desc = NULL;
+		options_menu.items[OPTIONS_RA_INDEX].on_confirm = OptionSaveChanges_openMenu;
+		options_menu.items[OPTIONS_RA_INDEX + 1].name = NULL;
+		options_menu.items[OPTIONS_RA_INDEX + 1].on_confirm = NULL;
+		save_changes_index = OPTIONS_RA_INDEX;
+	}
+}
+
+void OptionSaveChanges_updateDesc(void) {
+	options_menu.items[save_changes_index].desc = getSaveDesc();
+}
+
+// Update the Achievements menu item to show count (only when RA enabled)
+static char ach_desc_buffer[64] = {0};
+void OptionAchievements_updateDesc(void) {
+	if (!CFG_getRAEnable())
+		return;
+
+	if (RA_isGameLoaded()) {
+		uint32_t unlocked, total;
+		RA_getAchievementSummary(&unlocked, &total);
+		if (total > 0) {
+			snprintf(ach_desc_buffer, sizeof(ach_desc_buffer), "%u / %u 已解锁", unlocked, total);
+			options_menu.items[OPTIONS_RA_INDEX].desc = ach_desc_buffer;
+			return;
+		}
+		options_menu.items[OPTIONS_RA_INDEX].desc = (char*)"暂无成就";
+		return;
+	}
+	options_menu.items[OPTIONS_RA_INDEX].desc = RA_isGameUnknown() ? (char*)"未识别的游戏" : NULL;
+}
+
+// Arcade zips without a map.txt alias get the title the launcher shows for them
+// (.system/res/arcade/<TAG>.txt, keyed by the Roms folder's tag), so the menu
+// says "Metal Slug 6" rather than "mslug6". Leaves name alone otherwise. The
+// table is only read for .zip/.7z files, once per game: the answer is cached by
+// ROM path, so later menu opens don't re-parse it (FBN.txt has ~8000 lines).
+static void getArcadeTitle(const char* path, char* name) {
+	static char cached_path[MAX_PATH];
+	static char cached_title[MAX_PATH]; // "" = the table has no title for it
+	if (!ArcadeNames_isArcadeFile(baseName(path)))
+		return;
+	if (strcmp(cached_path, path) != 0) {
+		cached_title[0] = '\0';
+		char tag[MAX_PATH];
+		getEmuName(path, tag);
+		char table_path[MAX_PATH];
+		snprintf(table_path, sizeof(table_path), "%s/arcade/%s.txt", RES_PATH, ArcadeNames_tableTag(tag));
+		ArcadeNames* names = ArcadeNames_load(table_path);
+		const char* title = ArcadeNames_get(names, baseName(path));
+		if (title && strcmp(title, ".") != 0)
+			snprintf(cached_title, sizeof(cached_title), "%s", title);
+		ArcadeNames_free(names);
+		snprintf(cached_path, sizeof(cached_path), "%s", path);
+	}
+	if (cached_title[0])
+		snprintf(name, MAX_PATH, "%s", cached_title);
+}
+
+// alias must be at least MAX_PATH bytes
+bool getAlias(char* path, char* alias) {
+	bool is_alias = false;
+	char* tmp;
+	char map_path[MAX_PATH + 8]; // room to swap the filename for "map.txt"
+	snprintf(map_path, sizeof(map_path), "%s", path);
+	tmp = strrchr(map_path, '/');
+	if (tmp) {
+		tmp += 1;
+		strcpy(tmp, "map.txt");
+	}
+	char* file_name = strrchr(path, '/');
+	if (file_name)
+		file_name += 1;
+
+	if (exists(map_path)) {
+		FILE* file = fopen(map_path, "r");
+		if (file) {
+			char line[256];
+			while (fgets(line, 256, file) != NULL) {
+				normalizeNewline(line);
+				trimTrailingNewlines(line);
+				if (strlen(line) == 0)
+					continue; // skip empty lines
+
+				tmp = strchr(line, '\t');
+				if (tmp) {
+					tmp[0] = '\0';
+					char* key = line;
+					char* value = tmp + 1;
+					if (exactMatch(file_name, key)) {
+						snprintf(alias, MAX_PATH, "%s", value);
+						is_alias = true;
+						break;
+					}
+				}
+			}
+			fclose(file);
+		}
+	}
+	return is_alias;
+}
+
+int Menu_options(MenuList* list) {
+	MenuItem* items = list->items;
+	int type = list->type;
+
+	bool dirty = true;
+	int show_options = 1;
+	IndicatorType show_settings = INDICATOR_NONE;
+	int await_input = 0;
+
+	int count;
+	for (count = 0; items[count].name; count++)
+		;
+	int selected = 0;
+	ListLayout layout = UI_calcListLayout(screen);
+	// an untitled options page keeps the pill list's top gutter (LIST-LAYOUT §10.2)
+	layout.titled = (list->title && list->title[0]) || (list->desc && list->desc[0]);
+	int scroll = 0;
+
+	OptionSaveChanges_updateDesc();
+	OptionAchievements_updateDesc();
+
+	int defer_menu = false;
+	while (show_options) {
+		if (await_input) {
+			defer_menu = true;
+			list->on_confirm(list, selected);
+
+			selected += 1;
+			if (selected >= count)
+				selected = 0;
+			dirty = true;
+			await_input = false;
+		}
+
+		GFX_startFrame();
+		PAD_poll();
+		if (PAD_justRepeated(BTN_UP)) {
+			selected -= 1;
+			if (selected < 0)
+				selected = count - 1;
+			dirty = true;
+		} else if (PAD_justRepeated(BTN_DOWN)) {
+			selected += 1;
+			if (selected >= count)
+				selected = 0;
+			dirty = true;
+		} else {
+			MenuItem* item = &items[selected];
+			if (item->values && item->values != button_labels) { // not an input binding
+				if (PAD_justRepeated(BTN_LEFT)) {
+					if (item->value > 0)
+						item->value -= 1;
+					else {
+						int j;
+						for (j = 0; item->values[j]; j++)
+							;
+						item->value = j - 1;
+					}
+
+					if (item->on_change)
+						item->on_change(list, selected);
+					else if (list->on_change)
+						list->on_change(list, selected);
+
+					dirty = true;
+				} else if (PAD_justRepeated(BTN_RIGHT)) {
+					// first check if its not out of bounds already
+					int i = 0;
+					while (item->values[i])
+						i++;
+					if (item->value >= i)
+						item->value = 0;
+
+					if (item->values[item->value + 1])
+						item->value += 1;
+					else
+						item->value = 0;
+
+					if (item->on_change)
+						item->on_change(list, selected);
+					else if (list->on_change)
+						list->on_change(list, selected);
+
+					dirty = true;
+				}
+			}
+		}
+
+		// uint32_t now = SDL_GetTicks();
+		if (PAD_justPressed(BTN_B)) { // || PAD_tappedMenu(now)
+			show_options = 0;
+		} else if (PAD_justPressed(BTN_A)) {
+			MenuItem* item = &items[selected];
+			int result = MENU_CALLBACK_NOP;
+			if (item->on_confirm)
+				result = item->on_confirm(list, selected); // item-specific action, eg. Save for all games
+			else if (item->submenu)
+				result = Menu_options(item->submenu); // drill down, eg. main options menu
+			// TODO: is there a way to defer on_confirm for MENU_INPUT so we can clear the currently set value to indicate it is awaiting input?
+			// eg. set a flag to call on_confirm at the beginning of the next frame?
+			else if (list->on_confirm) {
+				if (item->values == button_labels)
+					await_input = 1; // button binding
+				else
+					result = list->on_confirm(list, selected); // list-specific action, eg. show item detail view or input binding
+			}
+			if (result == MENU_CALLBACK_EXIT)
+				show_options = 0;
+			else {
+				if (result == MENU_CALLBACK_NEXT_ITEM) {
+					selected += 1;
+					if (selected >= count)
+						selected = 0;
+				}
+				dirty = true;
+			}
+		} else if (type == MENU_INPUT) {
+			if (PAD_justPressed(BTN_X)) {
+				MenuItem* item = &items[selected];
+				item->value = 0;
+
+				if (item->on_change)
+					item->on_change(list, selected);
+				else if (list->on_change)
+					list->on_change(list, selected);
+
+				selected += 1;
+				if (selected >= count)
+					selected = 0;
+				dirty = true;
+			}
+		}
+
+		if (!defer_menu)
+			PWR_update(&dirty, &show_settings, Menu_beforeSleep, Menu_afterSleep);
+
+		// defer_menu suppresses power handling while the just-bound button (and
+		// any held MENU modifier) is released. Clear it once input has settled
+		// — keying off BTN_MENU alone left it stuck on forever when the user
+		// bound a plain button without holding MENU, disabling sleep/power for
+		// the rest of the options session.
+		if (defer_menu && !PAD_anyPressed())
+			defer_menu = false;
+
+		// an on_change handler may rebuild the rows (the Shaders page hides
+		// unused shader slots), so recount them after input and before this
+		// frame renders: a row past the new end has a NULL name, and drawing
+		// it with the old count crashed in the text truncation
+		for (count = 0; items[count].name; count++)
+			;
+		if (selected >= count)
+			selected = count - 1;
+		if (selected < 0)
+			selected = 0;
+		if (scroll > 0 && scroll + layout.items_per_page > count) {
+			scroll = count - layout.items_per_page;
+			if (scroll < 0)
+				scroll = 0;
+		}
+
+		if (dirty) {
+			GFX_clear(screen);
+
+			// Dimmed game screenshot background
+			if (menu.bitmap)
+				GFX_drawOnLayer(menu.bitmap, 0, 0, DEVICE_WIDTH, DEVICE_HEIGHT, 0.15f, 1, 0);
+
+			// Top bar with category/list name (legacy lists without a title
+			// keep showing their desc there). A page inside Options names it (LIST-LAYOUT §10.1):
+			// "选项 | 核心选项"; the Options page itself is plain "选项".
+			if (list->title && strcmp(list->title, "选项") != 0)
+				UI_renderMenuBarPage(screen, "选项", list->title);
+			else
+				UI_renderMenuBar(screen, list->title ? list->title : (list->desc ? list->desc : ""));
+
+			// Build UISettingsItem array from MenuItems
+			UISettingsItem settings_items[count];
+			for (int i = 0; i < count; i++) {
+				MenuItem* mi = &items[i];
+				settings_items[i] = (UISettingsItem){
+					.label = mi->name,
+					.value = NULL,
+					.swatch = -1,
+					.cycleable = 0,
+					// Titled lists show their section-wide desc as the bottom
+					// hint for items without one of their own
+					.desc = mi->desc ? mi->desc : (list->title ? list->desc : NULL),
+					.custom_draw = NULL,
+					.custom_draw_ctx = NULL,
+				};
+
+				if (await_input && i == selected) {
+					settings_items[i].value = "...";
+					settings_items[i].cycleable = 0;
+				} else if (mi->values && mi->values != button_labels) {
+					// Has selectable values — show current value
+					if (mi->value >= 0) {
+						int vc = 0;
+						while (mi->values[vc])
+							vc++;
+						if (mi->value < vc)
+							settings_items[i].value = mi->values[mi->value];
+					}
+					settings_items[i].cycleable = 1;
+				} else if (mi->values == button_labels) {
+					// Button binding — show current binding without cycle arrows
+					if (mi->value >= 0) {
+						int vc = 0;
+						while (mi->values[vc])
+							vc++;
+						if (mi->value < vc)
+							settings_items[i].value = PAD_buttonLabel(mi->values[mi->value]);
+					}
+					settings_items[i].cycleable = 0;
+				} else if (mi->submenu || mi->on_confirm || (list->on_confirm && !mi->values)) {
+					// Navigation item — show ">" as value
+					settings_items[i].value = ">";
+					settings_items[i].cycleable = 0;
+				}
+			}
+
+			UI_renderSettingsPage(screen, &layout, settings_items, count, selected, &scroll, NULL);
+
+			// Bottom bar
+			if (type == MENU_INPUT)
+				UI_renderButtonHintBar(screen, (char*[]){"B", "返回", "X", "CLEAR", "A", "设置", NULL});
+			else
+				UI_renderButtonHintBar(screen, (char*[]){"B", "返回", "A", "确定", NULL});
+
+			GFX_flip(screen);
+			dirty = false;
+		} else {
+			GFX_delay();
+		}
+
+		hdmimon();
+	}
+
+	// GFX_clearAll();
+	// GFX_flip(screen);
+
+	return 0;
+}
+
+void Menu_initState(void) {
+	if (exists(menu.slot_path))
+		menu.slot = getInt(menu.slot_path);
+	// The slot file may point at a hidden slot: RESUME_SLOT_DEFAULT (8) or the
+	// AUTO_RESUME_SLOT (9) that a plain quit writes to. Neither is user-visible
+	// in the Save/Load menu, so snap back to a regular slot (0-7) for the UI.
+	// A corrupt slot file can also yield a negative value.
+	if (menu.slot < 0 || menu.slot >= MENU_SLOT_COUNT)
+		menu.slot = 0;
+
+	menu.save_exists = 0;
+	menu.preview_exists = 0;
+}
+void Menu_updateState(void) {
+	int last_slot = state_slot;
+	state_slot = menu.slot;
+
+	char save_path[MAX_PATH];
+	State_getPath(save_path);
+
+	state_slot = last_slot;
+
+	// always sanitized/outer name, to keep main UI from having to inspect archives
+	snprintf(menu.bmp_path, sizeof(menu.bmp_path), "%s/%s.%d.bmp", menu.minui_dir, game.name, menu.slot);
+	snprintf(menu.txt_path, sizeof(menu.txt_path), "%s/%s.%d.txt", menu.minui_dir, game.name, menu.slot);
+
+	menu.save_exists = exists(save_path);
+	menu.preview_exists = menu.save_exists && exists(menu.bmp_path);
+}
+
+typedef struct {
+	char* pixels;		  // raw GL capture (ABGR8888), or NULL when surface is set
+	SDL_Surface* surface; // ready-to-save surface the worker owns, or NULL
+	char* path;
+	int w;
+	int h;
+} SaveImageArgs;
+
+// Wraps a raw GL-capture pixel buffer (ABGR8888, GFX_GL_screenCapture's format)
+// in an SDL_Surface converted to `format`. Frees the intermediate raw surface;
+// caller still owns (and must free) `pixels`.
+static SDL_Surface* rawCaptureToSurface(unsigned char* pixels, int w, int h, Uint32 format) {
+	SDL_Surface* rawSurface = SDL_CreateRGBSurfaceWithFormatFrom(
+		pixels, w, h, 32, w * 4, SDL_PIXELFORMAT_ABGR8888);
+	SDL_Surface* converted = rawSurface ? SDL_ConvertSurfaceFormat(rawSurface, format, 0) : NULL;
+	SDL_FreeSurface(rawSurface);
+	return converted;
+}
+int save_screenshot_thread(void* data) {
+	PWR_pinHelperThread(); // minarch_cpu_affinity=big -> SLOW set (no-op otherwise)
+	SaveImageArgs* args = (SaveImageArgs*)data;
+	SDL_Surface* converted = args->surface ? args->surface
+										   : rawCaptureToSurface(args->pixels, args->w, args->h, SDL_PIXELFORMAT_ARGB8888);
+
+	if (!converted) {
+		SDL_Log("Failed to convert screenshot surface: %s", SDL_GetError());
+	} else {
+		SDL_RWops* rw = SDL_RWFromFile(args->path, "wb");
+		if (!rw) {
+			SDL_Log("Failed to open file for writing: %s", SDL_GetError());
+		} else {
+			if (IMG_SavePNG_RW(converted, rw, 1) != 0) {
+				SDL_Log("Failed to save PNG: %s", SDL_GetError());
+			}
+		}
+	}
+	SDL_FreeSurface(converted);
+	free(args->path);
+	free(args->pixels);
+	free(args);
+	return 0;
+}
+SDL_Thread* screenshotsavethread;
+// GL-captures the current frame and returns it as a converted SDL_Surface
+// (caller owns and must SDL_FreeSurface it), or NULL on capture failure.
+SDL_Surface* Menu_captureScreenSurface(Uint32 pixel_format) {
+	Present_stop();
+	int cw, ch;
+	unsigned char* pixels = GFX_GL_screenCapture(&cw, &ch);
+	if (!pixels)
+		return NULL;
+	SDL_Surface* converted = rawCaptureToSurface(pixels, cw, ch, pixel_format);
+	free(pixels);
+	return converted;
+}
+// GL-captures the current frame and hands it to the background PNG-save
+// worker at `png_path`; waits for any previous save to finish first.
+void Menu_queueScreenshotSave(const char* png_path) {
+	Present_stop();
+	int cw, ch;
+	unsigned char* pixels = GFX_GL_screenCapture(&cw, &ch);
+	if (!pixels) {
+		SDL_Log("截图失败");
+		return;
+	}
+	SaveImageArgs* args = malloc(sizeof(SaveImageArgs));
+	args->pixels = pixels;
+	args->surface = NULL;
+	args->w = cw;
+	args->h = ch;
+	args->path = SDL_strdup(png_path);
+	Menu_waitScreenshotSave();
+	screenshotsavethread = SDL_CreateThread(save_screenshot_thread, "SaveScreenshotThread", args);
+}
+// Hands a copy of `surface` to the background PNG-save worker at `png_path`.
+// The in-game menu runs at a capped CPU clock, and a shader's scanlines or
+// LCD grid leave no flat runs for the encoder, so saving the full-screen slot
+// preview inline stalled Save for several seconds with a shader on.
+static void Menu_queueSurfaceSave(SDL_Surface* surface, const char* png_path) {
+	SDL_Surface* copy = SDL_ConvertSurface(surface, surface->format, 0);
+	if (!copy) {
+		SDL_Log("Failed to copy screenshot surface: %s", SDL_GetError());
+		return;
+	}
+	SaveImageArgs* args = malloc(sizeof(SaveImageArgs));
+	args->pixels = NULL;
+	args->surface = copy;
+	args->w = copy->w;
+	args->h = copy->h;
+	args->path = SDL_strdup(png_path);
+	Menu_waitScreenshotSave();
+	screenshotsavethread = SDL_CreateThread(save_screenshot_thread, "SaveScreenshotThread", args);
+}
+// Blocks until a queued PNG save has finished writing, so its file can be read.
+void Menu_waitScreenshotSave(void) {
+	SDL_WaitThread(screenshotsavethread, NULL);
+	screenshotsavethread = NULL;
+}
+void Menu_screenshot(void) {
+	char rom_name[MAX_PATH]; // getDisplayName/getAlias can write up to MAX_PATH
+	getDisplayName(game.alt_name, rom_name);
+	getAlias(game.path, rom_name);
+
+	time_t now = time(NULL);
+	struct tm* t = localtime(&now);
+	char buffer[100];
+	strftime(buffer, sizeof(buffer), "%Y-%m-%d-%H-%M-%S", t);
+
+	// make sure this actually exists
+	char screenshots_dir[MAX_PATH];
+	snprintf(screenshots_dir, sizeof(screenshots_dir), "%s/Screenshots", SDCARD_PATH);
+	mkdir(screenshots_dir, 0755);
+
+	char png_path[MAX_PATH];
+	snprintf(png_path, sizeof(png_path), "%s/Screenshots/%s.%s.png", SDCARD_PATH, rom_name, buffer);
+	Menu_queueScreenshotSave(png_path);
+
+	// Show notification if enabled
+	if (CFG_getNotifyScreenshot()) {
+		Notification_push(NOTIFICATION_SETTING, "截图已保存", NULL);
+	}
+}
+// X on Quit skips the autosave below, so it is only offered when there is one to skip.
+static bool Menu_canAutosaveQuit(void) {
+	// Block save states during multiplayer - causes connection breaks
+	if (Multiplayer_isActive())
+		return false;
+	return core.serialize_size && core.serialize_size(); // core cannot save states otherwise
+}
+// Quit with A auto-saves to the hidden auto-resume slot with a switcher
+// screenshot and repoints the .minui slot file at it, so RESUME always returns
+// to the exact quit moment (parity with DC.pak's quit behavior). Without this,
+// a bare quit leaves the switcher pointing at a stale (or no) state.
+static void Menu_autosaveQuit(void) {
+	if (!Menu_canAutosaveQuit())
+		return;
+
+	// disc path marker for multi-disc games, matching Menu_saveState
+	if (menu.total_discs && menu.disc >= 0) {
+		char txt_path[MAX_PATH];
+		snprintf(txt_path, sizeof(txt_path), "%s/%s.%d.txt", menu.minui_dir, game.name, AUTO_RESUME_SLOT);
+		char* disc_path = menu.disc_paths[menu.disc];
+		putFile(txt_path, disc_path + strlen(menu.base_path));
+	}
+
+	// switcher screenshot for the auto slot; the menu is open, so menu.bitmap
+	// holds the frame the user quit on
+	if (menu.bitmap) {
+		char bmp_path[MAX_PATH];
+		snprintf(bmp_path, sizeof(bmp_path), "%s/%s.%d.bmp", menu.minui_dir, game.name, AUTO_RESUME_SLOT);
+		SDL_RWops* rw = SDL_RWFromFile(bmp_path, "wb");
+		if (rw)
+			IMG_SavePNG_RW(menu.bitmap, rw, 1);
+	}
+
+	// only repoint RESUME at the auto slot if the state actually wrote —
+	// minarch exits right after this, so state_slot needs no restoring
+	state_slot = AUTO_RESUME_SLOT;
+	if (State_write())
+		putInt(menu.slot_path, AUTO_RESUME_SLOT);
+}
+
+void Menu_saveState(void) {
+	// Block save states during multiplayer - causes connection breaks
+	if (Multiplayer_isActive())
+		return;
+
+	Menu_updateState();
+
+	if (menu.total_discs && menu.disc >= 0) {
+		char* disc_path = menu.disc_paths[menu.disc];
+		putFile(menu.txt_path, disc_path + strlen(menu.base_path));
+	}
+
+	// if already in menu use menu.bitmap instead for saving screenshots otherwise create new one on the fly
+	if (newScreenshot) {
+		Menu_queueScreenshotSave(menu.bmp_path);
+		newScreenshot = 0;
+	} else if (menu.bitmap) {
+		Menu_queueSurfaceSave(menu.bitmap, menu.bmp_path);
+	}
+
+	state_slot = menu.slot;
+	putInt(menu.slot_path, menu.slot);
+	int success = State_write();
+
+	// Show notification if enabled
+	if (CFG_getNotifyManualSave()) {
+		char msg[NOTIFICATION_MAX_MESSAGE];
+		// User-facing slots are 1-8 (internal 0-7)
+		snprintf(msg, sizeof(msg), success ? "已保存即时存档 - 槽位 %d" : "保存失败 - 槽位 %d", menu.slot + 1);
+		Notification_push(NOTIFICATION_SAVE_STATE, msg, NULL);
+	}
+}
+void Menu_loadState(void) {
+	// Block load states during multiplayer - causes connection breaks
+	if (Multiplayer_isActive())
+		return;
+
+	Menu_updateState();
+
+	if (menu.save_exists) {
+		int disc_changed = 0;
+		if (menu.total_discs && menu.disc >= 0) {
+			char slot_disc_name[MAX_PATH];
+			slot_disc_name[0] = '\0'; // getFile writes nothing if the .txt is missing
+			getFile(menu.txt_path, slot_disc_name, MAX_PATH);
+
+			char slot_disc_path[MAX_PATH];
+			if (slot_disc_name[0] == '/')
+				snprintf(slot_disc_path, sizeof(slot_disc_path), "%s", slot_disc_name);
+			else
+				snprintf(slot_disc_path, sizeof(slot_disc_path), "%s%s", menu.base_path, slot_disc_name);
+
+			char* disc_path = menu.disc_paths[menu.disc];
+			if (!exactMatch(slot_disc_path, disc_path)) {
+				if (!Game_changeDisc(slot_disc_path)) {
+					// wrong disc and no way to swap it - loading the state
+					// anyway would silently mix disc and save
+					Notification_push(NOTIFICATION_LOAD_STATE, "读入失败 - 光盘错误", NULL);
+					return;
+				}
+				disc_changed = 1;
+			}
+		}
+
+		state_slot = menu.slot;
+		putInt(menu.slot_path, menu.slot);
+		int success;
+		if (disc_changed) {
+			// The pre-load state belongs to the disc that was just ejected.
+			State_invalidateUndo();
+			success = State_read();
+		} else {
+			success = State_readWithUndo();
+		}
+		Rewind_on_state_change();
+
+		// Show notification if enabled
+		if (CFG_getNotifyLoad()) {
+			char msg[NOTIFICATION_MAX_MESSAGE];
+			// User-facing slots are 1-8 (internal 0-7)
+			snprintf(msg, sizeof(msg), success ? "已读取即时存档 - 槽位 %d" : "读取失败 - 槽位 %d", menu.slot + 1);
+			Notification_push(NOTIFICATION_LOAD_STATE, msg, NULL);
+		}
+	}
+}
+
+void Menu_undoLoadState(void) {
+	// Deserializing state during multiplayer breaks the active connection.
+	if (Multiplayer_isActive())
+		return;
+
+	int success = State_undoLoad();
+
+	// Hardcore mode emits its own achievement notification.
+	if (CFG_getNotifyLoad() && !RA_isHardcoreModeActive()) {
+		Notification_push(NOTIFICATION_LOAD_STATE,
+						  success ? "已撤销读档" : "没有可撤销的操作", NULL);
+	}
+}
+
+// During any netplay session MENU only asks whether to leave: states, rewind
+// and fast-forward are off anyway, and a menu left open stalls the other player.
+// minarch's own engines pause both sides cleanly, so their dialog simply waits;
+// a session the core runs itself (flycast GGPO) can't pause, the other
+// player's game just waits for this one, so no answer within the grace ends
+// the session (leaves), well before the core's disconnect timeout.
+typedef struct {
+	uint32_t start;
+	int seconds_left; // -1: no countdown
+	bool menu_down;	  // MENU pressed while the dialog is up
+} LeaveNetplayCtx;
+
+static void leaveNetplay_render(SDL_Surface* dst, void* data) {
+	LeaveNetplayCtx* ctx = data;
+	char subtitle[128];
+	if (ctx->seconds_left >= 0)
+		snprintf(subtitle, sizeof(subtitle), "对方玩家正在等待：剩余 %d 秒。", ctx->seconds_left);
+	else
+		snprintf(subtitle, sizeof(subtitle), "离开将结束联机会话。");
+	UI_renderConfirmDialogHints(dst, "离开联机？", subtitle, (char*[]){"B", "CONTINUE", "A", "LEAVE", NULL});
+}
+
+static int leaveNetplay_handle(void* data) {
+	LeaveNetplayCtx* ctx = data;
+	if (Netplay_isConnected())
+		Netplay_pollWhilePaused(); // keep the lockstep link alive, as the full menu did
+	if (CoreNetplay_byePoll()) {   // the other player left meanwhile
+		CoreNetplay_markEnded();
+		return 1;
+	}
+	if (PAD_justPressed(BTN_A))
+		return 1;
+	if (PAD_justPressed(BTN_B))
+		return 0;
+	// MENU continues on its release: the game opens this dialog on a MENU
+	// release (ma_input.c), so closing on the press let that same press's
+	// release reopen it at once.
+	if (PAD_justPressed(BTN_MENU))
+		ctx->menu_down = true;
+	if (ctx->menu_down && PAD_justReleased(BTN_MENU))
+		return 0;
+	if (ctx->seconds_left >= 0) {
+		int left = CoreNetplay_leaveSecondsLeft(ctx->start, SDL_GetTicks());
+		if (left != ctx->seconds_left) {
+			ctx->seconds_left = left;
+			return UI_MODAL_DIRTY;
+		}
+	}
+	return UI_MODAL_CONTINUE;
+}
+
+// true = leave the session (and the game)
+static bool Menu_leaveNetplay(void) {
+	// A GBA link peer waits too (GBALink_setPaused), for as long as its pause
+	// lasts (GBALINK_PEER_PAUSE_MAX_MS / SIOLS_HOLD_MAX_US, 10 s past this grace).
+	bool timed = CoreNetplay_isActive() || GBALink_isConnected();
+	LeaveNetplayCtx ctx = {SDL_GetTicks(), timed ? CORE_NETPLAY_LEAVE_GRACE_MS / 1000 : -1};
+	UI_ModalOpts opts = {
+		.screen = screen,
+		.render = leaveNetplay_render,
+		.handle = leaveNetplay_handle,
+		.ctx = &ctx,
+		.timeout_ms = timed ? CORE_NETPLAY_LEAVE_GRACE_MS : 0, // expiry returns -1: leave
+		.reset_pad = true,
+	};
+	return UI_modalLoop(&opts) != 0;
+}
+
+void Menu_progressNotice(const char* title, const char* detail) {
+	Present_stop();
+	if (screen->w != DEVICE_WIDTH || screen->h != DEVICE_HEIGHT)
+		screen = GFX_resize(DEVICE_WIDTH, DEVICE_HEIGHT, DEVICE_PITCH);
+	GFX_clearShaders();
+	UI_renderConfirmDialogHints(screen, title, detail, (char*[]){NULL});
+	GFX_flip(screen);
+}
+
+void Menu_netplayNotice(const char* title, const char* subtitle, int hold_ms) {
+	Present_stop();
+	if (screen->w != DEVICE_WIDTH || screen->h != DEVICE_HEIGHT)
+		screen = GFX_resize(DEVICE_WIDTH, DEVICE_HEIGHT, DEVICE_PITCH);
+	GFX_clearShaders();
+	// the leave dialog's look, as a notice: no button row
+	UI_renderConfirmDialogHints(screen, title, subtitle, (char*[]){NULL});
+	GFX_flip(screen);
+	if (hold_ms > 0)
+		SDL_Delay(hold_ms);
+}
+
+void Menu_loop(void) {
+	Present_stop(); // the menu draws (and reads the frame back) on this thread
+	RA_onMenuOpen();
+	// the slot previews below are read back from disk
+	Menu_waitScreenshotSave();
+	menu.bitmap = Menu_captureScreenSurface(SDL_PIXELFORMAT_ARGB8888);
+	SDL_Surface* backing = SDL_CreateRGBSurfaceWithFormat(0, DEVICE_WIDTH, DEVICE_HEIGHT, 32, SDL_PIXELFORMAT_ARGB8888);
+
+
+	SDL_Rect dst = {
+		0,
+		0,
+		screen->w,
+		screen->h};
+	if (menu.bitmap)
+		SDL_BlitScaled(menu.bitmap, NULL, backing, &dst);
+
+	int restore_w = screen->w;
+	int restore_h = screen->h;
+	int restore_p = screen->pitch;
+	if (restore_w != DEVICE_WIDTH || restore_h != DEVICE_HEIGHT) {
+		screen = GFX_resize(DEVICE_WIDTH, DEVICE_HEIGHT, DEVICE_PITCH);
+	}
+
+	SRAM_write();
+	RTC_write();
+	if (!HAS_POWER_BUTTON)
+		PWR_enableSleep();
+	PWR_setCPUSpeed(CPU_SPEED_MENU); // set Hz directly
+
+	GFX_setEffect(EFFECT_NONE);
+
+	int rumble_strength = VIB_getStrength();
+	VIB_setStrength(0);
+
+	PWR_enableAutosleep();
+	PAD_reset();
+
+	// path and string things
+	char* tmp;
+	char rom_name[MAX_PATH]; // without extension or cruft
+	getDisplayName(game.name, rom_name);
+	if (!getAlias(game.path, rom_name))
+		getArcadeTitle(game.path, rom_name);
+
+	int rom_disc = -1;
+	char disc_name[16];
+	if (menu.total_discs) {
+		rom_disc = menu.disc;
+		sprintf(disc_name, "碟片 %i", menu.disc + 1);
+	}
+
+	int selected = 0; // resets every launch
+	Menu_initState();
+
+	IndicatorType show_setting = INDICATOR_NONE;
+	bool dirty = true;
+	int ignore_menu = 0;
+	int menu_start = 0;
+	SDL_Surface* preview = SDL_CreateRGBSurface(SDL_SWSURFACE, DEVICE_WIDTH / 2, DEVICE_HEIGHT / 2, 32, RGBA_MASK_8888);
+	char preview_path[MAX_PATH] = ""; // slot screenshot currently decoded into preview
+	int preview_valid = 0;
+
+	//set vid.blit to null for menu drawing no need for blitrender drawing
+	GFX_clearShaders();
+	if (Multiplayer_isActive()) {
+		// The GBA link peer was paused before we got here (minarch.c) and is
+		// resumed after the menu's teardown; leaving resumes it first, so a
+		// real-cable peer stuck mid-transfer ends as on a pulled cable.
+		if (Menu_leaveNetplay()) {
+			GBALink_setPaused(false);
+			Netplay_quitAll(); // as the full menu's Quit: close the link cleanly
+			quit = 1;
+		}
+		show_menu = 0; // straight to the teardown below
+	}
+	while (show_menu) {
+		GFX_startFrame();
+		uint32_t now = SDL_GetTicks();
+
+		PAD_poll();
+
+		if (Netplay_isConnected()) {
+			Netplay_pollWhilePaused();
+		}
+		// keep RA moving while paused (login retries, server replies). Not
+		// in the achievements page: its list points into the game data a
+		// finishing load would replace.
+		RA_idle();
+		int mp_active = Multiplayer_isActive();
+
+		if (PAD_justPressed(BTN_UP)) {
+			do {
+				selected -= 1;
+				if (selected < 0)
+					selected += MENU_ITEM_COUNT;
+			} while (mp_active && (selected == ITEM_SAVE || selected == ITEM_LOAD));
+			dirty = true;
+		} else if (PAD_justPressed(BTN_DOWN)) {
+			do {
+				selected += 1;
+				if (selected >= MENU_ITEM_COUNT)
+					selected -= MENU_ITEM_COUNT;
+			} while (mp_active && (selected == ITEM_SAVE || selected == ITEM_LOAD));
+			dirty = true;
+		} else if (PAD_justPressed(BTN_LEFT)) {
+			if (menu.total_discs > 1 && selected == ITEM_CONT) {
+				menu.disc -= 1;
+				if (menu.disc < 0)
+					menu.disc += menu.total_discs;
+				dirty = true;
+				sprintf(disc_name, "碟片 %i", menu.disc + 1);
+			} else if (selected == ITEM_SAVE || selected == ITEM_LOAD) {
+				menu.slot -= 1;
+				if (menu.slot < 0)
+					menu.slot += MENU_SLOT_COUNT;
+				dirty = true;
+			}
+		} else if (PAD_justPressed(BTN_RIGHT)) {
+			if (menu.total_discs > 1 && selected == ITEM_CONT) {
+				menu.disc += 1;
+				if (menu.disc == menu.total_discs)
+					menu.disc -= menu.total_discs;
+				dirty = true;
+				sprintf(disc_name, "碟片 %i", menu.disc + 1);
+			} else if (selected == ITEM_SAVE || selected == ITEM_LOAD) {
+				menu.slot += 1;
+				if (menu.slot >= MENU_SLOT_COUNT)
+					menu.slot -= MENU_SLOT_COUNT;
+				dirty = true;
+			}
+		}
+
+		if (dirty && (selected == ITEM_SAVE || selected == ITEM_LOAD)) {
+			Menu_updateState();
+		}
+
+		if (PAD_justPressed(BTN_B) || (BTN_WAKE != BTN_MENU && PAD_tappedMenu(now))) {
+			show_menu = 0;
+		} else if (PAD_justPressed(BTN_X)) {
+			if (!mp_active && selected == ITEM_LOAD && State_hasUndo()) {
+				Menu_undoLoadState();
+				show_menu = 0;
+			} else if (selected == ITEM_QUIT && Menu_canAutosaveQuit()) {
+				// quit without the auto-resume save: RESUME keeps its old point
+				Netplay_quitAll();
+				show_menu = 0;
+				quit = 1;
+			}
+		} else if (PAD_justPressed(BTN_A)) {
+			switch (selected) {
+			case ITEM_CONT:
+				if (menu.total_discs && menu.disc >= 0 && rom_disc != menu.disc) {
+					char* disc_path = menu.disc_paths[menu.disc];
+					Game_changeDisc(disc_path);
+				}
+				show_menu = 0;
+				break;
+
+			case ITEM_SAVE: {
+				Menu_saveState();
+				show_menu = 0;
+			} break;
+			case ITEM_LOAD: {
+				Menu_loadState();
+				show_menu = 0;
+			} break;
+			case ITEM_OPTS: {
+				if (simple_mode) {
+					Core_reset();
+					show_menu = 0;
+				} else {
+					int old_scaling = screen_scaling;
+					Options_updateVisibility();
+					Menu_options(&options_menu);
+					if (screen_scaling != old_scaling) {
+						selectScaler(renderer.true_w, renderer.true_h, renderer.src_p);
+
+						restore_w = screen->w;
+						restore_h = screen->h;
+						restore_p = screen->pitch;
+						screen = GFX_resize(DEVICE_WIDTH, DEVICE_HEIGHT, DEVICE_PITCH);
+						SDL_Rect dst = {0, 0, DEVICE_WIDTH, DEVICE_HEIGHT};
+						SDL_BlitScaled(menu.bitmap, NULL, backing, &dst);
+					}
+					dirty = true;
+				}
+			} break;
+			case ITEM_QUIT:
+				// before Netplay_quitAll so the netplay guard inside can skip
+				// the autosave while a session is live
+				Menu_autosaveQuit();
+				Netplay_quitAll();
+				show_menu = 0;
+				quit = 1; // TODO: tmp?
+				break;
+			}
+			if (!show_menu)
+				break;
+		}
+
+		PWR_update(&dirty, &show_setting, Menu_beforeSleep, Menu_afterSleep);
+		if (dirty) {
+			GFX_clear(screen);
+
+			GFX_drawOnLayer(menu.bitmap, 0, 0, DEVICE_WIDTH, DEVICE_HEIGHT, 0.15f, 1, 0);
+
+
+			UI_renderMenuBar(screen, rom_name);
+
+			if (!mp_active && selected == ITEM_LOAD && State_hasUndo())
+				UI_renderButtonHintBar(screen, (char*[]){"X", "撤销读档", "B", "返回", "A", "读档", NULL});
+			else if (selected == ITEM_QUIT && Menu_canAutosaveQuit())
+				UI_renderButtonHintBar(screen, (char*[]){"X", "退出", "B", "返回", "A", "保存并退出", NULL});
+			else
+				UI_renderButtonHintBar(screen, (char*[]){"B", "返回", "A", "选择", NULL});
+
+			// list: the text on the 14 dp list inset under the title, the pill edge 14 dp left of it (LIST-LAYOUT §10.1)
+			int oy = (((DEVICE_HEIGHT / FIXED_SCALE) - PADDING * 2) - (MENU_ITEM_COUNT * PILL_SIZE)) / 2;
+			int pill_x = UI_listPillX();
+			int text_x = UI_listTextX();
+			for (int i = 0; i < MENU_ITEM_COUNT; i++) {
+				char* item = menu.items[i];
+				SDL_Color text_color = COLOR_WHITE;
+
+				if (i == selected) {
+					text_color = uintToColour(THEME_COLOR5_255);
+
+					// disc change
+					if (menu.total_discs > 1 && i == ITEM_CONT) {
+						GFX_blitPillDark(ASSET_WHITE_PILL, screen, &(SDL_Rect){pill_x, SCALE1(oy + PADDING), screen->w - SCALE1(PADDING) - pill_x, SCALE1(PILL_SIZE)});
+						SDL_Surface* disc_text = GFX_renderText(font.large, disc_name, text_color);
+						if (disc_text) {
+							SDL_BlitSurface(disc_text, NULL, screen, &(SDL_Rect){screen->w - SCALE1(PADDING + BUTTON_PADDING) - disc_text->w, SCALE1(oy + PADDING + 4)});
+							SDL_FreeSurface(disc_text);
+						}
+					}
+
+					int ow;
+					GFX_measureText(font.large, item, &ow, NULL);
+					ow += SCALE1(BUTTON_PADDING * 2);
+
+					// pill
+					GFX_blitPillDark(ASSET_WHITE_PILL, screen, &(SDL_Rect){pill_x, SCALE1(oy + PADDING + (i * PILL_SIZE)), ow, SCALE1(PILL_SIZE)});
+				}
+
+				// text
+				SDL_Surface* text = GFX_renderText(font.large, item, text_color);
+				if (text) {
+					SDL_BlitSurface(text, NULL, screen, &(SDL_Rect){text_x, SCALE1(oy + PADDING + (i * PILL_SIZE) + 4)});
+					SDL_FreeSurface(text);
+				}
+			}
+
+			// slot preview
+			if (selected == ITEM_SAVE || selected == ITEM_LOAD) {
+#define WINDOW_RADIUS 4 // TODO: this logic belongs in blitRect?
+#define PAGINATION_HEIGHT 6
+				// unscaled
+				int hw = DEVICE_WIDTH / 2;
+				int hh = DEVICE_HEIGHT / 2;
+				int pw = hw + SCALE1(WINDOW_RADIUS * 2);
+				int ph = hh + SCALE1(WINDOW_RADIUS * 2 + PAGINATION_HEIGHT + WINDOW_RADIUS);
+				int ox = DEVICE_WIDTH - pw - SCALE1(PADDING);
+				oy = (DEVICE_HEIGHT - ph) / 2;
+
+				// window
+				GFX_blitRect(ASSET_STATE_BG, screen, &(SDL_Rect){ox, oy, pw, ph});
+				ox += SCALE1(WINDOW_RADIUS);
+				oy += SCALE1(WINDOW_RADIUS);
+
+				if (menu.preview_exists) { // has save, has preview
+					// decode the slot screenshot only when the slot changes
+					if (!exactMatch(preview_path, menu.bmp_path)) {
+						preview_valid = 0;
+						SDL_Surface* bmp = IMG_Load(menu.bmp_path);
+						if (bmp) {
+							SDL_Surface* raw_preview = SDL_ConvertSurfaceFormat(bmp, screen->format->format, 0);
+							if (raw_preview) {
+								SDL_FreeSurface(bmp);
+								bmp = raw_preview;
+							}
+							SDL_BlitScaled(bmp, NULL, preview, NULL);
+							SDL_FreeSurface(bmp);
+							preview_valid = 1;
+						}
+						snprintf(preview_path, sizeof(preview_path), "%s", menu.bmp_path);
+					}
+					SDL_Rect preview_rect = {ox, oy, hw, hh};
+					SDL_FillRect(screen, &preview_rect, SDL_MapRGBA(screen->format, 0, 0, 0, 255));
+					if (preview_valid)
+						SDL_BlitSurface(preview, NULL, screen, &(SDL_Rect){ox, oy});
+					else
+						GFX_blitMessage(font.large, "无预览", screen, &preview_rect);
+				} else {
+					SDL_Rect preview_rect = {ox, oy, hw, hh};
+					SDL_FillRect(screen, &preview_rect, SDL_MapRGBA(screen->format, 0, 0, 0, 255));
+					if (menu.save_exists)
+						GFX_blitMessage(font.large, "无预览", screen, &preview_rect);
+					else
+						GFX_blitMessage(font.large, "空槽位", screen, &preview_rect);
+				}
+
+				// pagination
+				ox += (pw - SCALE1(15 * MENU_SLOT_COUNT)) / 2;
+				oy += hh + SCALE1(WINDOW_RADIUS);
+				for (int i = 0; i < MENU_SLOT_COUNT; i++) {
+					if (i == menu.slot)
+						GFX_blitAsset(ASSET_PAGE, NULL, screen, &(SDL_Rect){ox + SCALE1(i * 15), oy});
+					else
+						GFX_blitAsset(ASSET_DOT, NULL, screen, &(SDL_Rect){ox + SCALE1(i * 15) + 4, oy + SCALE1(2)});
+				}
+			}
+			GFX_flip(screen);
+			dirty = false;
+		} else {
+			// please dont flip cause it will cause current_fps dip and audio is weird first seconds
+			GFX_delay();
+		}
+		hdmimon();
+	}
+
+	SDL_FreeSurface(preview);
+	if (menu.bitmap) {
+		SDL_FreeSurface(menu.bitmap);
+		menu.bitmap = NULL;
+	}
+	PAD_reset();
+
+	GFX_clearAll();
+
+	int count = 0;
+	char** overlayList = config.frontend.options[FE_OPT_OVERLAY].values;
+	while (overlayList && overlayList[count])
+		count++;
+	if (overlay >= 0 && overlay < count) {
+		GFX_setOverlay(overlayList[overlay], core.tag);
+	}
+
+	GFX_setOffsetX(cfg_screenx);
+	GFX_setOffsetY(cfg_screeny);
+	if (!quit) {
+		if (restore_w != DEVICE_WIDTH || restore_h != DEVICE_HEIGHT) {
+			screen = GFX_resize(restore_w, restore_h, restore_p);
+		}
+		GFX_setEffect(screen_effect);
+
+		GFX_clear(screen);
+
+		setOverclock(overclock); // restore overclock value
+		if (rumble_strength)
+			VIB_setStrength(rumble_strength);
+
+		if (!HAS_POWER_BUTTON)
+			PWR_disableSleep();
+	} else if (exists(NOUI_PATH))
+		PWR_powerOff(0); // TODO: won't work with threaded core, only check this once per launch
+
+
+	SDL_FreeSurface(backing);
+	PWR_disableAutosleep();
+}

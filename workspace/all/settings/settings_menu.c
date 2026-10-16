@@ -1,0 +1,581 @@
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include <unistd.h>
+
+#include "settings_menu.h"
+#include "defines.h"
+#include "api.h"
+#include "ui_buttonhintbar.h"
+#include "ui_menubar.h"
+#include "ui_list.h"
+#include "ui_listview.h"
+#include "ui_loadingoverlay.h"
+#include "display_helper.h"
+
+// ============================================
+// Page Stack
+// ============================================
+
+#define MAX_PAGE_DEPTH 8
+static SettingsPage* page_stack[MAX_PAGE_DEPTH];
+static int stack_depth = 0;
+
+void settings_menu_init(void) {
+	stack_depth = 0;
+	memset(page_stack, 0, sizeof(page_stack));
+}
+
+void settings_menu_push(SettingsPage* page) {
+	if (stack_depth >= MAX_PAGE_DEPTH)
+		return;
+	// Page transition: the category marquee paints GPU LAYER_SCROLLTEXT,
+	// which persists over the incoming page unless cleared. It re-primes on
+	// the next list render (ScrollText repaints the layer every render).
+	GFX_clearLayers(LAYER_SCROLLTEXT);
+	if (page->on_show)
+		page->on_show(page);
+	page_stack[stack_depth++] = page;
+}
+
+void settings_menu_pop(void) {
+	if (stack_depth <= 0)
+		return;
+	// Same layer hygiene as settings_menu_push, for the pop direction.
+	GFX_clearLayers(LAYER_SCROLLTEXT);
+	SettingsPage* page = page_stack[stack_depth - 1];
+	if (page->on_hide)
+		page->on_hide(page);
+	stack_depth--;
+}
+
+SettingsPage* settings_menu_current(void) {
+	if (stack_depth <= 0)
+		return NULL;
+	return page_stack[stack_depth - 1];
+}
+
+// ============================================
+// Visible Item Helpers
+// ============================================
+
+int settings_page_visible_count(SettingsPage* page) {
+	int count = 0;
+	for (int i = 0; i < page->item_count; i++) {
+		if (page->items[i].visible)
+			count++;
+	}
+	return count;
+}
+
+SettingItem* settings_page_visible_item(SettingsPage* page, int visible_idx) {
+	int count = 0;
+	for (int i = 0; i < page->item_count; i++) {
+		if (!page->items[i].visible)
+			continue;
+		if (count == visible_idx)
+			return &page->items[i];
+		count++;
+	}
+	return NULL;
+}
+
+int settings_page_actual_to_visible(SettingsPage* page, int actual_idx) {
+	int count = 0;
+	for (int i = 0; i < page->item_count; i++) {
+		if (!page->items[i].visible)
+			continue;
+		if (i == actual_idx)
+			return count;
+		count++;
+	}
+	return -1;
+}
+
+// ============================================
+// Item Sync & Reset
+// ============================================
+
+void settings_item_sync(SettingItem* item) {
+	if ((item->type != ITEM_CYCLE && item->type != ITEM_COLOR) || !item->get_value)
+		return;
+
+	int val = item->get_value();
+
+	if (item->values) {
+		// Find matching value in values array
+		for (int i = 0; i < item->label_count; i++) {
+			if (item->values[i] == val) {
+				item->current_idx = i;
+				return;
+			}
+		}
+	} else {
+		// Direct mapping: idx = value
+		if (val >= 0 && val < item->label_count)
+			item->current_idx = val;
+	}
+}
+
+void settings_page_reset_all(SettingsPage* page) {
+	for (int i = 0; i < page->item_count; i++) {
+		SettingItem* item = &page->items[i];
+		if (item->on_reset) {
+			item->on_reset();
+			settings_item_sync(item);
+		}
+	}
+}
+
+void settings_page_init_lock(SettingsPage* page) {
+	pthread_rwlock_init(&page->lock, NULL);
+}
+
+// NOTE: no settings_page_destroy — the wifi/bt pages that init this rwlock live
+// for the whole (short-lived) settings process; teardown (wifi_page_destroy /
+// bt_page_destroy) only signals the scanner threads to stop and deliberately
+// lets process exit reclaim the page, its items, and this lock. Destroying the
+// rwlock here would also be unsafe: those scanner threads are not joined, so one
+// could still rdlock it after destruction.
+
+// ============================================
+// Async op helpers (shared by WiFi/BT toggle + action wait loops)
+// ============================================
+
+void settings_run_async(SDL_Surface* screen, const char* title,
+						void* (*fn)(void*), void* arg,
+						volatile int* done, volatile int* busy) {
+	if (*busy) // an async op is still running in the background
+		return;
+
+	*busy = 1;
+	*done = 0;
+
+	pthread_t t;
+	if (pthread_create(&t, NULL, fn, arg) != 0) {
+		*busy = 0;
+		return;
+	}
+	pthread_detach(t);
+
+	while (!*done) {
+		GFX_startFrame();
+		PAD_poll();
+		if (PAD_justPressed(BTN_B))
+			break;
+
+		GFX_clear(screen);
+		settings_menu_render(screen, 0);
+		UI_renderLoadingOverlay(screen, title, "按 B 取消");
+		GFX_flip(screen);
+	}
+}
+
+void settings_scanner_sleep(int seconds, volatile int* running, volatile int* wake) {
+	for (int i = 0; i < seconds * 10 && *running && (!wake || !*wake); i++)
+		usleep(100000); // 100ms intervals
+}
+
+// ============================================
+// Cycle item value change
+// ============================================
+
+static void cycle_item_next(SettingItem* item, int step) {
+	if ((item->type != ITEM_CYCLE && item->type != ITEM_COLOR) || item->label_count <= 0)
+		return;
+
+	item->current_idx = (item->current_idx + step) % item->label_count;
+
+	int val = item->values ? item->values[item->current_idx] : item->current_idx;
+	if (item->set_value)
+		item->set_value(val);
+	settings_item_sync(item); // setter may refuse (e.g. cancelled PIN setup)
+}
+
+static void cycle_item_prev(SettingItem* item, int step) {
+	if ((item->type != ITEM_CYCLE && item->type != ITEM_COLOR) || item->label_count <= 0)
+		return;
+
+	item->current_idx = ((item->current_idx - step) % item->label_count + item->label_count) % item->label_count;
+
+	int val = item->values ? item->values[item->current_idx] : item->current_idx;
+	if (item->set_value)
+		item->set_value(val);
+	settings_item_sync(item); // setter may refuse (e.g. cancelled PIN setup)
+}
+
+// ============================================
+// Input Handling
+// ============================================
+
+void settings_menu_handle_input(bool* quit, bool* dirty) {
+	SettingsPage* page = settings_menu_current();
+	if (!page) {
+		*quit = true;
+		return;
+	}
+
+	int has_lock = (page->dynamic_start >= 0);
+	if (has_lock)
+		pthread_rwlock_rdlock(&page->lock);
+
+	int vis_count = settings_page_visible_count(page);
+
+	// Redraw when dynamic page has pending updates (scanner or async toggle)
+	if (page->needs_layout)
+		*dirty = true;
+
+	// Tick callback (for dynamic pages)
+	if (page->on_tick)
+		page->on_tick(page);
+
+	if (vis_count == 0) {
+		if (has_lock)
+			pthread_rwlock_unlock(&page->lock);
+
+		// Allow back/exit even with no items
+		if (PAD_justPressed(BTN_B)) {
+			settings_menu_pop();
+			*dirty = true;
+			if (stack_depth <= 0)
+				*quit = true;
+		}
+		return;
+	}
+
+	// Clamp selection
+	if (page->selected >= vis_count)
+		page->selected = vis_count - 1;
+	if (page->selected < 0)
+		page->selected = 0;
+
+	SettingItem* sel = settings_page_visible_item(page, page->selected);
+	int changed = 0;
+
+	// Navigation
+	if (PAD_justRepeated(BTN_UP)) {
+		page->selected--;
+		if (page->selected < 0)
+			page->selected = vis_count - 1;
+		changed = 1;
+	}
+	if (PAD_justRepeated(BTN_DOWN)) {
+		page->selected++;
+		if (page->selected >= vis_count)
+			page->selected = 0;
+		changed = 1;
+	}
+
+	// Value cycling (disabled when input_blocked)
+	if (!page->input_blocked && sel && (sel->type == ITEM_CYCLE || sel->type == ITEM_COLOR)) {
+		int r1 = PAD_justRepeated(BTN_R1);
+		int l1 = PAD_justRepeated(BTN_L1);
+		int step = (r1 || l1) ? 10 : 1;
+
+		if (PAD_justRepeated(BTN_RIGHT) || r1) {
+			cycle_item_next(sel, step);
+			changed = 1;
+		}
+		if (PAD_justRepeated(BTN_LEFT) || l1) {
+			cycle_item_prev(sel, step);
+			changed = 1;
+		}
+		if (sel->a_cycles && PAD_justPressed(BTN_A)) {
+			cycle_item_next(sel, 1);
+			changed = 1;
+		}
+		if (sel->on_clear && PAD_justPressed(BTN_X)) {
+			sel->on_clear();
+			settings_item_sync(sel);
+			changed = 1;
+		}
+	}
+
+	// Snapshot the selected item before releasing the lock: on scanner
+	// pages the scanner thread may rewrite page->items[] the moment the
+	// wrlock becomes available, and the A-press below runs unlocked.
+	SettingItem sel_snap = {0};
+	if (sel)
+		sel_snap = *sel;
+
+	if (has_lock)
+		pthread_rwlock_unlock(&page->lock);
+
+	// Confirm (A button)
+	if (sel && PAD_justPressed(BTN_A)) {
+		switch (sel_snap.type) {
+		case ITEM_CYCLE:
+			// static rows only: scanner pages never set on_press on a CYCLE item
+			if (sel_snap.on_press && !sel_snap.a_cycles) {
+				sel_snap.on_press();
+				settings_item_sync(sel);
+				changed = 1;
+			}
+			break;
+		case ITEM_BUTTON:
+			if (sel_snap.on_press)
+				sel_snap.on_press();
+			changed = 1;
+			break;
+		case ITEM_SUBMENU: {
+			// Support lazy page creation: if submenu is NULL but on_press
+			// and user_data are set, call on_press to create the page,
+			// then read the result from user_data (a SettingsPage** pointer)
+			SettingsPage* submenu = sel_snap.submenu;
+			if (!submenu && sel_snap.on_press && sel_snap.user_data) {
+				sel_snap.on_press();
+				submenu = *(SettingsPage**)sel_snap.user_data;
+				sel->submenu = submenu; // static item; scanners never build submenus
+			}
+			if (submenu) {
+				settings_menu_push(submenu);
+				changed = 1;
+			}
+			break;
+		}
+		case ITEM_TEXT_INPUT: {
+			extern char* UIKeyboard_open(const char* prompt);
+			char* result = UIKeyboard_open(sel_snap.name);
+			PAD_poll();
+			PAD_reset();
+			if (result) {
+				// text-input items are static; sel stays valid for the write-back
+				strncpy(sel->text_value, result, sizeof(sel->text_value) - 1);
+				sel->text_value[sizeof(sel->text_value) - 1] = '\0';
+				if (sel_snap.on_text_set)
+					sel_snap.on_text_set(result);
+				free(result);
+			}
+			changed = 1;
+			break;
+		}
+		default:
+			break;
+		}
+	}
+
+	// Back (B button)
+	if (PAD_justPressed(BTN_B)) {
+		settings_menu_pop();
+		changed = 1;
+		if (stack_depth <= 0)
+			*quit = true;
+	}
+
+	if (changed)
+		*dirty = true;
+}
+
+// ============================================
+// Rendering: Category List Mode
+// ============================================
+
+static ListView category_view;
+
+bool settings_menu_glide_active(void) {
+	// settings.c / ratools.c call this unconditionally every loop iteration
+	// (the loop only tracks glide_active -> dirty; it has no separate idle
+	// branch). That makes this the one safe site to advance the marquee's
+	// idle animation: without it, once a long category name starts scrolling
+	// Busy goes false (isScrolling, not needsRender) and the marquee would
+	// freeze mid-scroll. Ticking here keeps it animating during idle frames.
+	//
+	// Gated to list pages only: category_view belongs to the category list,
+	// and ticking it over a value/settings page would keep repainting the
+	// category marquee onto LAYER_SCROLLTEXT underneath that page (undoing
+	// the push/pop clears above).
+	SettingsPage* page = settings_menu_current();
+	if (!page || !page->is_list)
+		return false;
+	UI_listViewTickIdle(&category_view);
+	return UI_listViewBusy(&category_view);
+}
+
+static void category_get_row(void* ctx, int i, bool selected, ListViewRow* out) {
+	SettingsPage* page = ctx;
+	SettingItem* item = settings_page_visible_item(page, i);
+	const char* text = item ? item->name : "";
+	if (item && item->type == ITEM_STATIC && item->get_display)
+		text = item->get_display();
+	out->label = text;
+	(void)selected;
+}
+
+static void render_list_mode(SDL_Surface* screen, SettingsPage* page,
+							 ListLayout* layout) {
+	(void)layout;
+	int vis_count = settings_page_visible_count(page);
+	ListView* v = &category_view;
+	v->title = NULL; // framework draws menu bar + hints
+	v->hint_pairs = NULL;
+	v->font = font.large;
+	v->count = vis_count;
+	v->get_row = category_get_row;
+	v->ctx = page;
+	v->list_id = (const void*)page; // page identity: push/pop snaps the glide
+	// hosted mode: the framework owns selection/scroll; sync before render
+	v->selected = page->selected;
+	v->scroll = page->scroll;
+	UI_listViewRender(v, screen);
+	page->scroll = v->scroll; // widget may have advanced the window
+}
+
+// ============================================
+// Rendering: Settings Page Mode (2-layer pills)
+// ============================================
+
+static void settings_custom_draw_wrapper(SDL_Surface* screen, void* ctx,
+										 int x, int y, int w, int h, int selected) {
+	SettingItem* item = (SettingItem*)ctx;
+	item->custom_draw(screen, item, x, y, w, h, selected);
+}
+
+static void render_settings_mode(SDL_Surface* screen, SettingsPage* page, ListLayout* layout) {
+	int vis_count = settings_page_visible_count(page);
+	if (vis_count == 0)
+		return;
+
+	// Build UISettingsItem array from visible SettingItems
+	UISettingsItem ui_items[vis_count];
+	for (int i = 0; i < vis_count; i++) {
+		SettingItem* item = settings_page_visible_item(page, i);
+		ui_items[i] = (UISettingsItem){
+			.label = item->name,
+			.value = NULL,
+			.swatch = -1,
+			.cycleable = 0,
+			.desc = item->desc,
+			.custom_draw = NULL,
+			.custom_draw_ctx = NULL,
+		};
+
+		if (item->custom_draw) {
+			ui_items[i].custom_draw = settings_custom_draw_wrapper;
+			ui_items[i].custom_draw_ctx = item;
+		} else {
+			// Build value string
+			if ((item->type == ITEM_CYCLE || item->type == ITEM_COLOR) &&
+				item->labels && item->current_idx >= 0 &&
+				item->current_idx < item->label_count) {
+				ui_items[i].value = item->labels[item->current_idx];
+				ui_items[i].cycleable = 1;
+			} else if (item->type == ITEM_STATIC) {
+				if (item->get_display)
+					ui_items[i].value = item->get_display();
+				else if (item->display_text[0])
+					ui_items[i].value = item->display_text;
+			} else if (item->type == ITEM_TEXT_INPUT) {
+				if (item->get_text)
+					ui_items[i].value = item->get_text();
+				else if (item->text_value[0])
+					ui_items[i].value = item->text_value;
+			}
+
+			// Color swatch
+			if (item->type == ITEM_COLOR && item->values &&
+				item->current_idx >= 0 && item->current_idx < item->label_count) {
+				ui_items[i].swatch = (int)(uint32_t)item->values[item->current_idx];
+			}
+		}
+	}
+
+	UI_renderSettingsPage(screen, layout, ui_items, vis_count,
+						  page->selected, &page->scroll, page->status_msg);
+}
+
+// ============================================
+// Button Hint Bar helpers
+// ============================================
+
+static void render_hints_for_page(SDL_Surface* screen, SettingsPage* page) {
+	SettingItem* sel = settings_page_visible_item(page, page->selected);
+	int is_root = (stack_depth <= 1);
+
+	char* back_label = is_root ? "退出" : "返回";
+	char* hints[10] = {NULL};
+
+	if (!sel) {
+		char* h[] = {"B", back_label, NULL};
+		memcpy(hints, h, sizeof(h));
+	} else if (page->is_list) {
+		char* h[] = {"B", back_label, "A", "打开", NULL};
+		memcpy(hints, h, sizeof(h));
+	} else {
+		switch (sel->type) {
+		case ITEM_CYCLE:
+		case ITEM_COLOR: {
+			if (sel->on_press && sel->on_clear) {
+				// a binding row: A captures a button, X clears it
+				char* h[] = {"LEFT/RIGHT", "更改", "B", back_label, "X", "清除", "A", "设置", NULL};
+				memcpy(hints, h, sizeof(h));
+				break;
+			}
+			if (sel->a_cycles) {
+				// a two-value flip row: A steps the value too
+				char* h[] = {"LEFT/RIGHT", "更改", "B", back_label, "A", "更改", NULL};
+				memcpy(hints, h, sizeof(h));
+				break;
+			}
+			char* h[] = {"LEFT/RIGHT", "更改", "B", back_label, NULL};
+			memcpy(hints, h, sizeof(h));
+			break;
+		}
+		case ITEM_BUTTON: {
+			char* h[] = {"B", back_label, "A", "选择", NULL};
+			memcpy(hints, h, sizeof(h));
+			break;
+		}
+		case ITEM_SUBMENU: {
+			char* h[] = {"B", back_label, "A", "打开", NULL};
+			memcpy(hints, h, sizeof(h));
+			break;
+		}
+		case ITEM_TEXT_INPUT: {
+			char* h[] = {"B", back_label, "A", "编辑", NULL};
+			memcpy(hints, h, sizeof(h));
+			break;
+		}
+		default: {
+			char* h[] = {"B", back_label, NULL};
+			memcpy(hints, h, sizeof(h));
+			break;
+		}
+		}
+	}
+
+	UI_renderButtonHintBar(screen, hints);
+}
+
+// ============================================
+// Main Render
+// ============================================
+
+void settings_menu_render(SDL_Surface* screen, IndicatorType show_setting) {
+	SettingsPage* page = settings_menu_current();
+	if (!page)
+		return;
+
+	GFX_clear(screen);
+
+	UI_renderMenuBar(screen, page->title);
+
+	// Calculate list layout (an untitled options page keeps the pill list's top gutter)
+	ListLayout layout = UI_calcListLayout(screen);
+	layout.titled = page->title && page->title[0];
+
+	int has_lock = (page->dynamic_start >= 0);
+	if (has_lock)
+		pthread_rwlock_rdlock(&page->lock);
+
+	// Render items
+	if (page->is_list)
+		render_list_mode(screen, page, &layout);
+	else
+		render_settings_mode(screen, page, &layout);
+
+	if (has_lock)
+		pthread_rwlock_unlock(&page->lock);
+
+	// Button hints at bottom
+	render_hints_for_page(screen, page);
+}

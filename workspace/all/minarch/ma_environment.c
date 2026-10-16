@@ -1,0 +1,487 @@
+#include "ma_internal.h"
+#include "utils.h"
+#include "ma_environment.h"
+#include "ma_hwrender.h"
+#include "ma_core.h"
+#include "ma_input.h"
+#include "ma_config.h"
+#include "ma_options.h"
+#include "ma_runframe.h"
+#include "ma_opts_dump.h"
+#include "ra_integration.h"
+#include "ma_core_progress.h"
+#include "core_netplay.h"
+#include "gbalink.h"
+#include "gbalink_mode.h"
+
+static bool set_rumble_state(unsigned port, enum retro_rumble_effect effect, uint16_t strength) {
+	(void)port; // single motor, port is not distinguishable
+	// track the strong and weak effects separately and drive the one motor at
+	// the stronger of the two — previously a weak-effect request drove the
+	// motor at full strength (and clobbered the strong value)
+	static uint16_t rumble_strong = 0;
+	static uint16_t rumble_weak = 0;
+	if (effect == RETRO_RUMBLE_STRONG)
+		rumble_strong = strength;
+	else if (effect == RETRO_RUMBLE_WEAK)
+		rumble_weak = strength;
+	VIB_setStrength(rumble_strong > rumble_weak ? rumble_strong : rumble_weak);
+	return 1;
+}
+// libretro's perf interface: a monotonic clock and CPU features for real,
+// profiling hooks as no-ops. Some cores call get_time_usec unconditionally
+// (older flycast does while pausing its emulation thread to save a state)
+static retro_time_t perf_get_time_usec(void) {
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (retro_time_t)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
+}
+static uint64_t perf_get_cpu_features(void) {
+#if defined(__aarch64__) || defined(__ARM_NEON)
+	return RETRO_SIMD_NEON;
+#else
+	return 0;
+#endif
+}
+static retro_perf_tick_t perf_get_counter(void) {
+	return (retro_perf_tick_t)perf_get_time_usec();
+}
+static void perf_noop(struct retro_perf_counter* counter) {
+	(void)counter;
+}
+static void perf_log_noop(void) {
+}
+bool environment_callback(unsigned cmd, void* data) { // copied from picoarch initially
+
+	switch (cmd) {
+	// case RETRO_ENVIRONMENT_SET_ROTATION: { /* 1 */
+	// 	break;
+	// }
+	case RETRO_ENVIRONMENT_GET_OVERSCAN: { /* 2 */
+		bool* out = (bool*)data;
+		if (out)
+			*out = true;
+		break;
+	}
+	case RETRO_ENVIRONMENT_GET_CAN_DUPE: { /* 3 */
+		bool* out = (bool*)data;
+		if (out)
+			*out = true;
+		break;
+	}
+	case RETRO_ENVIRONMENT_SET_MESSAGE: { /* 6 */
+		const struct retro_message* message = (const struct retro_message*)data;
+		if (message)
+			LOG_info("%s\n", message->msg);
+		break;
+	}
+	case RETRO_ENVIRONMENT_SET_MESSAGE_EXT: { /* 60 */
+		// Progress (e.g. mupen64plus-next converting a hi-res texture pack on
+		// first launch) is shown as a notice page; other messages are logged,
+		// as plain SET_MESSAGE ones are.
+		const struct retro_message_ext* message = (const struct retro_message_ext*)data;
+		if (message && message->msg) {
+			if (message->type == RETRO_MESSAGE_TYPE_PROGRESS)
+				CoreProgress_set(message->msg);
+			else
+				LOG_info("%s\n", message->msg);
+		}
+		return true;
+	}
+	case RETRO_ENVIRONMENT_SHUTDOWN: { /* 7 */
+		// A core's own quit path (e.g. Doom's quit menu, FBNeo's error screen)
+		// or a fatal init failure (VICE, PUAE, cap32) asking the frontend to
+		// exit. Without this the request is silently dropped and the main loop
+		// keeps running a core that has given up.
+		LOG_info("Core requested shutdown\n");
+		CoreNetplay_markEnded(); // a GGPO core stops like this when the peer is gone
+		quit = 1;
+		break;
+	}
+	case RETRO_ENVIRONMENT_SET_PERFORMANCE_LEVEL: { /* 8 */
+													// puts("RETRO_ENVIRONMENT_SET_PERFORMANCE_LEVEL");
+													// TODO: used by fceumm at least
+		break;
+	}
+	case RETRO_ENVIRONMENT_GET_SYSTEM_DIRECTORY: { /* 9 */
+		const char** out = (const char**)data;
+		if (out) {
+			*out = core.bios_dir;
+		}
+		break;
+	}
+	case RETRO_ENVIRONMENT_SET_PIXEL_FORMAT: { /* 10 */
+		const enum retro_pixel_format* format = (const enum retro_pixel_format*)data;
+		if (!format)
+			return false;
+		// Check if the requested format is supported
+		if (*format == RETRO_PIXEL_FORMAT_XRGB8888) {
+			fmt = RETRO_PIXEL_FORMAT_XRGB8888;
+			return true; // Indicate success
+		} else if (*format == RETRO_PIXEL_FORMAT_RGB565) {
+			fmt = RETRO_PIXEL_FORMAT_RGB565;
+			return true; // Indicate success
+		}
+		fmt = RETRO_PIXEL_FORMAT_RGB565;
+		return false; // Indicate failure
+	}
+	case RETRO_ENVIRONMENT_SET_INPUT_DESCRIPTORS: { /* 11 */
+		// puts("RETRO_ENVIRONMENT_SET_INPUT_DESCRIPTORS\n");
+		Input_init((const struct retro_input_descriptor*)data);
+		// descriptors are consumed; returning false makes some cores stop re-sending them
+		return true;
+	}
+	case RETRO_ENVIRONMENT_SET_DISK_CONTROL_INTERFACE: { /* 13 */
+		const struct retro_disk_control_callback* var =
+			(const struct retro_disk_control_callback*)data;
+
+		if (var) {
+			memset(&disk_control_ext, 0, sizeof(struct retro_disk_control_ext_callback));
+			memcpy(&disk_control_ext, var, sizeof(struct retro_disk_control_callback));
+		}
+		break;
+	}
+
+	// TODO: this is called whether using variables or options
+	case RETRO_ENVIRONMENT_GET_VARIABLE: { /* 15 */
+		// puts("RETRO_ENVIRONMENT_GET_VARIABLE ");
+		struct retro_variable* var = (struct retro_variable*)data;
+		if (var && var->key) {
+			var->value = OptionList_getOptionValue(&config.core, var->key);
+			var->value = FF_coreOptionValue(var->key, var->value);
+			// gpsp_serial: Automatic means real link cable in a USB Cable
+			// session, and "lockstep" exists only there (gbalink_mode.c).
+			var->value = gbalink_serial_option(var->key, var->value, getenv("NETPLAY_MODE"));
+		}
+		// fflush(stdout);
+		break;
+	}
+	// TODO: I think this is where the core reports its variables (the precursor to options)
+	// TODO: this is called if RETRO_ENVIRONMENT_GET_CORE_OPTIONS_VERSION sets out to 0
+	// TODO: not used by anything yet
+	case RETRO_ENVIRONMENT_SET_VARIABLES: { /* 16 */
+		// puts("RETRO_ENVIRONMENT_SET_VARIABLES");
+		const struct retro_variable* vars = (const struct retro_variable*)data;
+		if (vars) {
+			OptsCache_refreshVars(vars);
+			OptionList_reset();
+			OptionList_vars(vars);
+			Config_reapplyOptions();
+		}
+		break;
+	}
+	case RETRO_ENVIRONMENT_SET_SUPPORT_NO_GAME: { /* 18 */
+		break;
+	}
+	case RETRO_ENVIRONMENT_GET_VARIABLE_UPDATE: { /* 17 */
+		bool* out = (bool*)data;
+		if (out) {
+			*out = config.core.changed;
+			config.core.changed = 0;
+		}
+		break;
+	}
+	case RETRO_ENVIRONMENT_SET_FRAME_TIME_CALLBACK: { /* 21 */
+		break;
+	}
+	case RETRO_ENVIRONMENT_SET_AUDIO_CALLBACK: { /* 22 */
+		// minarch never calls a core's audio callback, so refuse it: a core
+		// that was told yes waits to be asked for audio and plays silence
+		// (older flycast builds), while a refused one pushes samples itself
+		return false;
+	}
+	case RETRO_ENVIRONMENT_GET_PERF_INTERFACE: { /* 28 */
+		struct retro_perf_callback* cb = (struct retro_perf_callback*)data;
+		if (!cb)
+			return false;
+		cb->get_time_usec = perf_get_time_usec;
+		cb->get_cpu_features = perf_get_cpu_features;
+		cb->get_perf_counter = perf_get_counter;
+		cb->perf_register = perf_noop;
+		cb->perf_start = perf_noop;
+		cb->perf_stop = perf_noop;
+		cb->perf_log = perf_log_noop;
+		break;
+	}
+	case RETRO_ENVIRONMENT_GET_RUMBLE_INTERFACE: { /* 23 */
+		struct retro_rumble_interface* iface = (struct retro_rumble_interface*)data;
+		if (iface)
+			iface->set_rumble_state = set_rumble_state;
+		break;
+	}
+	case RETRO_ENVIRONMENT_GET_INPUT_DEVICE_CAPABILITIES: {
+		unsigned* out = (unsigned*)data;
+		if (out)
+			*out = (1 << RETRO_DEVICE_JOYPAD) | (1 << RETRO_DEVICE_ANALOG);
+		break;
+	}
+	case RETRO_ENVIRONMENT_GET_LOG_INTERFACE: { /* 27 */
+		struct retro_log_callback* log_cb = (struct retro_log_callback*)data;
+		if (log_cb)
+			log_cb->log = (void (*)(enum retro_log_level, const char*, ...))LOG_note; // same difference
+		break;
+	}
+	case RETRO_ENVIRONMENT_GET_SAVE_DIRECTORY: { /* 31 */
+		const char** out = (const char**)data;
+		if (out)
+			*out = core.saves_dir; // save_dir;
+		break;
+	}
+	case RETRO_ENVIRONMENT_SET_CONTROLLER_INFO: { /* 35 */
+		const struct retro_controller_info* infos = (const struct retro_controller_info*)data;
+		if (infos) {
+			// TODO: store to gamepad_values/gamepad_labels for gamepad_device
+			const struct retro_controller_info* info = &infos[0];
+			for (int i = 0; i < info->num_types; i++) {
+				const struct retro_controller_description* type = &info->types[i];
+				// currently only enabled for PlayStation: pcsx_rearmed names it
+				// "dualshock" (517), SwanStation "Analog Controller (DualShock)" (261)
+				if (type->desc && containsString((char*)type->desc, "dualshock")) {
+					static char dualshock_id[12];
+					snprintf(dualshock_id, sizeof(dualshock_id), "%u", type->id);
+					gamepad_values[1] = dualshock_id;
+					has_custom_controllers = 1;
+					break;
+				}
+				// printf("\t%i: %s\n", type->id, type->desc);
+			}
+		}
+		fflush(stdout);
+		return false; // TODO: tmp
+		break;
+	}
+	case RETRO_ENVIRONMENT_SET_MEMORY_MAPS: { /* 36 | RETRO_ENVIRONMENT_EXPERIMENTAL */
+		// Core is providing its memory map for achievement checking
+		const struct retro_memory_map* mmap = (const struct retro_memory_map*)data;
+		RA_setMemoryMap(mmap);
+		break;
+	}
+	case RETRO_ENVIRONMENT_GET_LANGUAGE: { /* 39 */
+		// puts("RETRO_ENVIRONMENT_GET_LANGUAGE");
+		if (data)
+			*(int*)data = RETRO_LANGUAGE_ENGLISH;
+		break;
+	}
+	case RETRO_ENVIRONMENT_GET_CURRENT_SOFTWARE_FRAMEBUFFER: { /* (40 | RETRO_ENVIRONMENT_EXPERIMENTAL) */
+		// puts("RETRO_ENVIRONMENT_GET_CURRENT_SOFTWARE_FRAMEBUFFER");
+		break;
+	}
+
+	case RETRO_ENVIRONMENT_GET_AUDIO_VIDEO_ENABLE: {
+		// fixes fbneo save state graphics corruption
+		// puts("RETRO_ENVIRONMENT_GET_AUDIO_VIDEO_ENABLE");
+		int* out_p = (int*)data;
+		if (out_p) {
+			int out = 0;
+			out |= RETRO_AV_ENABLE_VIDEO;
+			out |= RETRO_AV_ENABLE_AUDIO;
+			*out_p = out;
+		}
+		break;
+	}
+
+	// RETRO_ENVIRONMENT_SET_SUPPORT_ACHIEVEMENTS (42 | RETRO_ENVIRONMENT_EXPERIMENTAL)
+	// RETRO_ENVIRONMENT_GET_VFS_INTERFACE (45 | RETRO_ENVIRONMENT_EXPERIMENTAL)
+	// RETRO_ENVIRONMENT_GET_AUDIO_VIDEO_ENABLE (47 | RETRO_ENVIRONMENT_EXPERIMENTAL)
+	// RETRO_ENVIRONMENT_GET_INPUT_BITMASKS (51 | RETRO_ENVIRONMENT_EXPERIMENTAL)
+	case RETRO_ENVIRONMENT_GET_INPUT_BITMASKS: { /* 51 | RETRO_ENVIRONMENT_EXPERIMENTAL */
+		bool* out = (bool*)data;
+		if (out)
+			*out = true;
+		break;
+	}
+	case RETRO_ENVIRONMENT_GET_CORE_OPTIONS_VERSION: { /* 52 */
+		// puts("RETRO_ENVIRONMENT_GET_CORE_OPTIONS_VERSION");
+		if (data)
+			*(unsigned*)data = 2;
+		break;
+	}
+	case RETRO_ENVIRONMENT_SET_CORE_OPTIONS: { /* 53 */
+		// puts("RETRO_ENVIRONMENT_SET_CORE_OPTIONS");
+		if (data) {
+			OptsCache_refreshV1((const struct retro_core_option_definition*)data);
+			OptionList_reset();
+			OptionList_init((const struct retro_core_option_definition*)data);
+			Config_reapplyOptions();
+		}
+		break;
+	}
+	case RETRO_ENVIRONMENT_SET_CORE_OPTIONS_INTL: { /* 54 */
+		// puts("RETRO_ENVIRONMENT_SET_CORE_OPTIONS_INTL");
+		const struct retro_core_options_intl* options = (const struct retro_core_options_intl*)data;
+		if (options && options->us) {
+			OptsCache_refreshV1(options->us);
+			OptionList_reset();
+			OptionList_init(options->us);
+			Config_reapplyOptions();
+		}
+		break;
+	}
+	case RETRO_ENVIRONMENT_SET_CORE_OPTIONS_DISPLAY: { /* 55 */
+													   // puts("RETRO_ENVIRONMENT_SET_CORE_OPTIONS_DISPLAY");
+		if (data) {
+			const struct retro_core_option_display* display = (const struct retro_core_option_display*)data;
+			OptionList_setOptionVisibility(&config.core, display->key, display->visible);
+		}
+		break;
+	}
+	case RETRO_ENVIRONMENT_GET_DISK_CONTROL_INTERFACE_VERSION: { /* 57 */
+		unsigned* out = (unsigned*)data;
+		if (out)
+			*out = 1;
+		break;
+	}
+	case RETRO_ENVIRONMENT_SET_DISK_CONTROL_EXT_INTERFACE: { /* 58 */
+		const struct retro_disk_control_ext_callback* var =
+			(const struct retro_disk_control_ext_callback*)data;
+
+		if (var) {
+			memcpy(&disk_control_ext, var, sizeof(struct retro_disk_control_ext_callback));
+		}
+		break;
+	}
+	// TODO: RETRO_ENVIRONMENT_GET_MESSAGE_INTERFACE_VERSION 59
+	// TODO: used by mgba, (but only during frameskip?)
+	// case RETRO_ENVIRONMENT_SET_AUDIO_BUFFER_STATUS_CALLBACK: { /* 62 */
+	// 	const struct retro_audio_buffer_status_callback *cb = (const struct retro_audio_buffer_status_callback *)data;
+	// 	if (cb) {
+	// 		core.audio_buffer_status = cb->callback;
+	// 	} else {
+	// 		core.audio_buffer_status = NULL;
+	// 	}
+	// 	break;
+	// }
+	// TODO: used by mgba, (but only during frameskip?)
+	// case RETRO_ENVIRONMENT_SET_MINIMUM_AUDIO_LATENCY: { /* 63 */
+	//
+	// 	const unsigned *latency_ms = (const unsigned *)data;
+	// 	if (latency_ms) {
+	// 		unsigned frames = *latency_ms * core.fps / 1000;
+	// 		if (frames < 30)
+	// 			// audio_buffer_size_override = frames;
+	// 		else
+	// 	}
+	// 	break;
+	// }
+
+	// TODO: RETRO_ENVIRONMENT_SET_FASTFORWARDING_OVERRIDE 64
+	case RETRO_ENVIRONMENT_SET_CONTENT_INFO_OVERRIDE: { /* 65 */
+		// const struct retro_system_content_info_override* info = (const struct retro_system_content_info_override* )data;
+		break;
+	}
+	// RETRO_ENVIRONMENT_GET_GAME_INFO_EXT 66
+	case RETRO_ENVIRONMENT_SET_CORE_OPTIONS_V2: { /* 67 */
+		// puts("RETRO_ENVIRONMENT_SET_CORE_OPTIONS_V2");
+		if (data) {
+			OptsCache_refreshV2((const struct retro_core_options_v2*)data);
+			OptionList_reset();
+			OptionList_v2_init((const struct retro_core_options_v2*)data);
+			Config_reapplyOptions();
+		}
+		break;
+	}
+	case RETRO_ENVIRONMENT_SET_CORE_OPTIONS_V2_INTL: { /* 68 */
+		// puts("RETRO_ENVIRONMENT_SET_CORE_OPTIONS_V2_INTL");
+		if (data) {
+			const struct retro_core_options_v2_intl* intl = (const struct retro_core_options_v2_intl*)data;
+			OptsCache_refreshV2(intl->us);
+			OptionList_reset();
+			OptionList_v2_init(intl->us);
+			Config_reapplyOptions();
+		}
+		break;
+	}
+	case RETRO_ENVIRONMENT_SET_CORE_OPTIONS_UPDATE_DISPLAY_CALLBACK: { /* 69 */
+		// puts("RETRO_ENVIRONMENT_SET_CORE_OPTIONS_UPDATE_DISPLAY_CALLBACK");
+		if (data) {
+			struct retro_core_options_update_display_callback* update_display_cb = (struct retro_core_options_update_display_callback*)data;
+			core.update_visibility_callback = update_display_cb->callback;
+		} else {
+			core.update_visibility_callback = NULL;
+		}
+		break;
+	}
+	// used by fceumm
+	// TODO: used by gambatte for L/R palette switching (seems like it needs to return true even if data is NULL to indicate support)
+	case RETRO_ENVIRONMENT_SET_VARIABLE: {
+		// puts("RETRO_ENVIRONMENT_SET_VARIABLE");
+		const struct retro_variable* var = (const struct retro_variable*)data;
+		if (var && var->key) {
+			// printf("\t%s = %s\n", var->key, var->value);
+			OptionList_setOptionValue(&config.core, var->key, var->value);
+		}
+		// a NULL data (or keyless struct) is only probing for support, which the
+		// trailing `return true` reports; never write back through the pointer
+		break;
+	}
+
+	// unused
+	// case RETRO_ENVIRONMENT_SET_FRAME_TIME_CALLBACK: {
+	// 	puts("RETRO_ENVIRONMENT_SET_FRAME_TIME_CALLBACK"); fflush(stdout);
+	// 	break;
+	// }
+	// case RETRO_ENVIRONMENT_GET_THROTTLE_STATE: {
+	// 	puts("RETRO_ENVIRONMENT_GET_THROTTLE_STATE"); fflush(stdout);
+	// 	break;
+	// }
+	case RETRO_ENVIRONMENT_GET_FASTFORWARDING: { /* 49 */
+		// older threaded flycast builds only pace themselves and push audio
+		// once the frontend answers this
+		bool* out = (bool*)data;
+		if (out)
+			*out = fast_forward != 0;
+		break;
+	}
+	case RETRO_ENVIRONMENT_SET_FASTFORWARDING_OVERRIDE: {
+		// SPIKE: mupen64plus-next's core netplay asks for fast-forward while
+		// this side lags the lead player (netplay_get_input) and drops it once
+		// caught up; without it a lagging device can never catch up. NULL is
+		// the "is it supported" probe.
+		const struct retro_fastforwarding_override* o = (const struct retro_fastforwarding_override*)data;
+		if (o && CoreNetplay_isActive())
+			fast_forward = setFastForward(o->fastforward);
+		return true;
+	}
+	case RETRO_ENVIRONMENT_SET_HW_RENDER: {
+		return HWR_setCallback((struct retro_hw_render_callback*)data);
+	}
+	case RETRO_ENVIRONMENT_SET_SYSTEM_AV_INFO: { /* 32 */
+		// GPU cores only: software cores keep today's "unsupported" answer
+		// until this is verified across the bundled cores.
+		const struct retro_system_av_info* av = (const struct retro_system_av_info*)data;
+		if (!av || !HWR_active())
+			return false;
+		// the core renders the new size in this same retro_run
+		HWR_growFramebuffer(av->geometry.max_width, av->geometry.max_height);
+		Core_setPendingAVInfo(av);
+		return true;
+	}
+	case RETRO_ENVIRONMENT_SET_GEOMETRY: { /* 37 */
+		const struct retro_game_geometry* geometry = (const struct retro_game_geometry*)data;
+		if (!geometry || !HWR_active())
+			return false;
+		HWR_growFramebuffer(geometry->max_width, geometry->max_height);
+		Core_setPendingGeometry(geometry);
+		return true;
+	}
+	case RETRO_ENVIRONMENT_GET_PREFERRED_HW_RENDER: {
+		if (!data)
+			return false;
+		*(unsigned*)data = RETRO_HW_CONTEXT_OPENGLES3;
+		return true;
+	}
+	case RETRO_ENVIRONMENT_SET_NETPACKET_INTERFACE: {
+		const struct retro_netpacket_callback* cb =
+			(const struct retro_netpacket_callback*)data;
+		if (cb) {
+			core.has_netpacket = true;
+			GBALink_setCoreCallbacks(cb);
+		}
+		return true;
+	}
+	default:
+		// LOG_debug("Unsupported environment cmd: %u\n", cmd);
+		return false;
+	}
+	return true;
+}

@@ -1,0 +1,2577 @@
+/*
+ * settings.c - NxRedux Settings application (C99 rewrite)
+ *
+ * Converted from settings.cpp to pure C.
+ * Builds the full settings menu tree and runs the main loop.
+ */
+
+#include "msettings.h"
+#include "emu_shortcuts.h"
+#include "vib_levels.h"
+#include "defines.h"
+#include "api.h"
+#include "config.h"
+#include "rgba.h"
+#include "utils.h"
+#include "settings_menu.h"
+#include "settings_wifi.h"
+#include "settings_bt.h"
+#include "settings_audio.h"
+#include "settings_led.h"
+#include "settings_developer.h"
+#include "settings_updater.h"
+#include "settings_input.h"
+#include "settings_clock.h"
+#include "settings_bootlogo.h"
+#include "ui_menubar.h"
+#include "ui_confirmdialog.h"
+#include "ui_quitrequest.h"
+#include "ui_splash.h"
+#include "ui_pindialog.h"
+#include "ui_buttonhintbar.h"
+#include "display_helper.h"
+
+#include <dirent.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+// ============================================
+// Device detection
+// ============================================
+
+typedef enum {
+	MODEL_UNKNOWN = 0,
+	MODEL_BRICK,
+	MODEL_BRICKPRO,
+	MODEL_SMARTPRO,
+	MODEL_SMARTPROS,
+	MODEL_FLIP
+} DeviceModel;
+
+typedef struct {
+	DevicePlatform platform;
+	DeviceModel model;
+} DeviceInfo;
+
+static DeviceInfo device_detect(void) {
+	DeviceInfo dev = {PLAT_UNKNOWN, MODEL_UNKNOWN};
+
+	const char* device = getenv("DEVICE");
+	if (!device)
+		return dev;
+
+	if (exactMatch("brick", device)) {
+		dev.model = MODEL_BRICK;
+		dev.platform = PLAT_TG5040;
+	} else if (exactMatch("brickpro", device)) {
+		dev.model = MODEL_BRICKPRO;
+		dev.platform = PLAT_TG5040;
+	} else if (exactMatch("smartpro", device)) {
+		dev.model = MODEL_SMARTPRO;
+		dev.platform = PLAT_TG5040;
+	} else if (exactMatch("smartpros", device)) {
+		dev.model = MODEL_SMARTPROS;
+		dev.platform = PLAT_TG5050;
+	} else if (exactMatch("my355", device)) {
+		dev.model = MODEL_FLIP;
+		dev.platform = PLAT_MY355;
+	}
+	return dev;
+}
+
+static int has_color_temp(const DeviceInfo* dev) {
+	return dev->platform == PLAT_TG5040;
+}
+
+static int has_contrast_sat(const DeviceInfo* dev) {
+	return dev->platform == PLAT_MY355 || dev->platform == PLAT_TG5040;
+}
+
+static int has_exposure(const DeviceInfo* dev) {
+	return dev->platform == PLAT_TG5040;
+}
+
+static int has_active_cooling(const DeviceInfo* dev) {
+	return dev->platform == PLAT_TG5050;
+}
+
+static int has_stock_osd_restore(const DeviceInfo* dev) {
+	if (dev->platform != PLAT_TG5040 && dev->platform != PLAT_TG5050)
+		return 0;
+	const char* device = getenv("DEVICE");
+	if (!device)
+		return 0;
+	char path[MAX_PATH];
+	snprintf(path, sizeof(path), "%s/osd-stock/%s.zip", SYSTEM_PATH, device);
+	return access(path, F_OK) == 0;
+}
+
+static int has_fn_switch(const DeviceInfo* dev) {
+	return dev->platform == PLAT_TG5050 || dev->platform == PLAT_TG5040;
+}
+
+// Dedicated physical F1/F2 keys, usable as menu-level shortcuts (the Smart
+// Pro/S map BTN_FN1/2 onto their stick clicks instead).
+static int has_fn_keys(const DeviceInfo* dev) {
+	return dev->model == MODEL_BRICK || dev->model == MODEL_BRICKPRO;
+}
+
+static int has_wifi(const DeviceInfo* dev) {
+	return dev->platform == PLAT_TG5050 || dev->platform == PLAT_TG5040 || dev->platform == PLAT_MY355;
+}
+
+static int has_bluetooth(const DeviceInfo* dev) {
+	return dev->platform == PLAT_TG5050 || dev->platform == PLAT_TG5040 || dev->platform == PLAT_MY355;
+}
+
+static int has_leds(const DeviceInfo* dev) {
+	(void)dev;
+	return MAX_LIGHTS > 0;
+}
+
+static int has_display_hw(const DeviceInfo* dev) {
+	(void)dev;
+	return 1;
+}
+
+static int has_power_mgmt(const DeviceInfo* dev) {
+	(void)dev;
+	return 1;
+}
+
+static void extract_busybox_version(const char* output, char* version_out, int max_len) {
+	/* Search for "BusyBox vX.Y.Z" pattern */
+	const char* p = strstr(output, "BusyBox v");
+	if (!p) {
+		version_out[0] = '\0';
+		return;
+	}
+	p += 9; /* skip "BusyBox v" to point at "X.Y.Z" */
+	int i = 0;
+	while (p[i] && p[i] != ' ' && p[i] != '\n' && p[i] != '\r' && i < max_len - 1) {
+		version_out[i] = p[i];
+		i++;
+	}
+	version_out[i] = '\0';
+}
+
+// ============================================
+// Color values and labels (110 entries)
+// ============================================
+
+#define COLOR_COUNT 110
+
+const int color_values[COLOR_COUNT] = {
+	0x000022, 0x000044, 0x000066, 0x000088, 0x0000AA, 0x0000CC, 0x1E2329, 0x3366FF, 0x4D7AFF, 0x6699FF, 0x80B3FF, 0x99CCFF, 0xB3D9FF,
+	0x002222, 0x004444, 0x006666, 0x008888, 0x00AAAA, 0x00CCCC, 0x33FFFF, 0x4DFFFF, 0x66FFFF, 0x80FFFF, 0x99FFFF, 0xB3FFFF,
+	0x002200, 0x004400, 0x006600, 0x008800, 0x00AA00, 0x00CC00, 0x33FF33, 0x4DFF4D, 0x66FF66, 0x80FF80, 0x99FF99, 0xB3FFB3,
+	0x220022, 0x440044, 0x660066, 0x880088, 0x9B2257, 0xAA00AA, 0xCC00CC, 0xFF33FF, 0xFF4DFF, 0xFF66FF, 0xFF80FF, 0xFF99FF, 0xFFB3FF,
+	0x110022, 0x220044, 0x330066, 0x440088, 0x5500AA, 0x6600CC, 0x8833FF, 0x994DFF, 0xAA66FF, 0xBB80FF, 0xCC99FF, 0xDDB3FF,
+	0x220000, 0x440000, 0x660000, 0x880000, 0xAA0000, 0xCC0000, 0xFF3333, 0xFF4D4D, 0xFF6666, 0xFF8080, 0xFF9999, 0xFFB3B3,
+	0x222200, 0x444400, 0x666600, 0x888800, 0xAAAA00, 0xCCCC00, 0xFFFF33, 0xFFFF4D, 0xFFFF66, 0xFFFF80, 0xFFFF99, 0xFFFFB3,
+	0x221100, 0x442200, 0x663300, 0x884400, 0xAA5500, 0xCC6600, 0xFF8833, 0xFF994D, 0xFFAA66, 0xFFBB80, 0xFFCC99, 0xFFDDB3,
+	0x000000, 0x141414, 0x282828, 0x3C3C3C, 0x505050, 0x646464, 0x8C8C8C, 0xA0A0A0, 0xB4B4B4, 0xC8C8C8, 0xDCDCDC, 0xFFFFFF};
+
+const char* color_labels[COLOR_COUNT] = {
+	"0x000022", "0x000044", "0x000066", "0x000088", "0x0000AA", "0x0000CC", "0x1E2329", "0x3366FF", "0x4D7AFF", "0x6699FF", "0x80B3FF", "0x99CCFF", "0xB3D9FF",
+	"0x002222", "0x004444", "0x006666", "0x008888", "0x00AAAA", "0x00CCCC", "0x33FFFF", "0x4DFFFF", "0x66FFFF", "0x80FFFF", "0x99FFFF", "0xB3FFFF",
+	"0x002200", "0x004400", "0x006600", "0x008800", "0x00AA00", "0x00CC00", "0x33FF33", "0x4DFF4D", "0x66FF66", "0x80FF80", "0x99FF99", "0xB3FFB3",
+	"0x220022", "0x440044", "0x660066", "0x880088", "0x9B2257", "0xAA00AA", "0xCC00CC", "0xFF33FF", "0xFF4DFF", "0xFF66FF", "0xFF80FF", "0xFF99FF", "0xFFB3FF",
+	"0x110022", "0x220044", "0x330066", "0x440088", "0x5500AA", "0x6600CC", "0x8833FF", "0x994DFF", "0xAA66FF", "0xBB80FF", "0xCC99FF", "0xDDB3FF",
+	"0x220000", "0x440000", "0x660000", "0x880000", "0xAA0000", "0xCC0000", "0xFF3333", "0xFF4D4D", "0xFF6666", "0xFF8080", "0xFF9999", "0xFFB3B3",
+	"0x222200", "0x444400", "0x666600", "0x888800", "0xAAAA00", "0xCCCC00", "0xFFFF33", "0xFFFF4D", "0xFFFF66", "0xFFFF80", "0xFFFF99", "0xFFFFB3",
+	"0x221100", "0x442200", "0x663300", "0x884400", "0xAA5500", "0xCC6600", "0xFF8833", "0xFF994D", "0xFFAA66", "0xFFBB80", "0xFFCC99", "0xFFDDB3",
+	"0x000000", "0x141414", "0x282828", "0x3C3C3C", "0x505050", "0x646464", "0x8C8C8C", "0xA0A0A0", "0xB4B4B4", "0xC8C8C8", "0xDCDCDC", "0xFFFFFF"};
+
+/* Color opacity (percentage of the packed RGBA alpha byte) */
+#define OPACITY_COUNT 10
+static const char* opacity_labels[OPACITY_COUNT] = {"100%", "90%", "80%", "70%", "60%", "50%", "40%", "30%", "20%", "10%"};
+static const int opacity_values[OPACITY_COUNT] = {100, 90, 80, 70, 60, 50, 40, 30, 20, 10};
+
+// ============================================
+// Static label/value arrays
+// ============================================
+
+static const char* on_off_labels[] = {"关", "开"};
+
+static int screen_timeout_values[] = {0, 5, 10, 15, 30, 45, 60, 90, 120, 240, 360, 600};
+static const char* screen_timeout_labels[] = {"永不", "5s", "10s", "15s", "30s", "45s", "60s", "90s", "2m", "4m", "6m", "10m"};
+#define SCREEN_TIMEOUT_COUNT 12
+
+static int sleep_timeout_values[] = {5, 10, 15, 30, 45, 60, 90, 120, 240, 360, 600};
+static const char* sleep_timeout_labels[] = {"5s", "10s", "15s", "30s", "45s", "60s", "90s", "2m", "4m", "6m", "10m"};
+#define SLEEP_TIMEOUT_COUNT 11
+
+/* Volume labels (Muted, 5%, 10%, ... 100%) — the Volume item itself lives on
+   the Audio page (settings_audio.c); these are reused for the FN-switch page */
+static const char* volume_labels[] = {
+	"已静音", "5%", "10%", "15%", "20%", "25%", "30%", "35%", "40%", "45%", "50%",
+	"55%", "60%", "65%", "70%", "75%", "80%", "85%", "90%", "95%", "100%"};
+
+/* Notification duration */
+static int notify_duration_values[] = {1, 2, 3, 4, 5};
+static const char* notify_duration_labels[] = {"1s", "2s", "3s", "4s", "5s"};
+#define NOTIFY_DURATION_COUNT 5
+
+/* Progress notification duration */
+static int progress_duration_values[] = {0, 1, 2, 3, 4, 5};
+static const char* progress_duration_labels[] = {"关", "1s", "2s", "3s", "4s", "5s"};
+#define PROGRESS_DURATION_COUNT 6
+
+/* Default view */
+static int default_view_values[] = {SCREEN_GAMELIST, SCREEN_GAMESWITCHER};
+static const char* default_view_labels[] = {"内容列表", "游戏切换器"};
+#define DEFAULT_VIEW_COUNT 2
+
+/* Game switcher games */
+static int switcher_games_values[] = {1, 0};
+static const char* switcher_games_labels[] = {"仅可继续的", "全部最近游戏"};
+#define SWITCHER_GAMES_COUNT 2
+
+/* Save format */
+static int save_format_values[] = {SAVE_FORMAT_SAV, SAVE_FORMAT_SRM, SAVE_FORMAT_SRM_UNCOMPRESSED, SAVE_FORMAT_GEN};
+static const char* save_format_labels[] = {"MinUI", "Retroarch（压缩）", "Retroarch（未压缩）", "通用"};
+#define SAVE_FORMAT_COUNT 4
+
+/* State format */
+static int state_format_values[] = {STATE_FORMAT_SAV, STATE_FORMAT_SRM_EXTRADOT, STATE_FORMAT_SRM_UNCOMPRESSED_EXTRADOT, STATE_FORMAT_SRM, STATE_FORMAT_SRM_UNCOMPRESSED};
+static const char* state_format_labels[] = {"MinUI", "Retroarch 风格（压缩）", "Retroarch 风格（未压缩）", "Retroarch（压缩）", "Retroarch（未压缩）"};
+#define STATE_FORMAT_COUNT 5
+
+/* Fan speed */
+static int fan_speed_values[] = {-3, -2, -1, 0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100};
+static const char* fan_speed_labels[] = {"高性能", "标准", "安静", "0%", "10%", "20%", "30%", "40%", "50%", "60%", "70%", "80%", "90%", "100%"};
+#define FAN_SPEED_COUNT 14
+
+/* Brightness (0-10): direct index mapping */
+static const char* brightness_labels[] = {"0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10"};
+#define BRIGHTNESS_LABEL_COUNT 11
+
+/* Color temperature (0-40): generated at init */
+static char colortemp_label_buf[41][4];
+static const char* colortemp_labels[41];
+#define COLORTEMP_LABEL_COUNT 41
+
+/* Contrast (-4 to 5): 10 labels */
+static const char* contrast_labels[] = {"-4", "-3", "-2", "-1", "0", "1", "2", "3", "4", "5"};
+static int contrast_values[] = {-4, -3, -2, -1, 0, 1, 2, 3, 4, 5};
+#define CONTRAST_LABEL_COUNT 10
+
+/* Saturation (-5 to 5): 11 labels */
+static const char* saturation_labels[] = {"-5", "-4", "-3", "-2", "-1", "0", "1", "2", "3", "4", "5"};
+static int saturation_values[] = {-5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5};
+#define SATURATION_LABEL_COUNT 11
+
+/* Exposure (-4 to 5): 10 labels */
+static const char* exposure_labels[] = {"-4", "-3", "-2", "-1", "0", "1", "2", "3", "4", "5"};
+static int exposure_values[] = {-4, -3, -2, -1, 0, 1, 2, 3, 4, 5};
+#define EXPOSURE_LABEL_COUNT 10
+
+/* On/off as int values 0,1 */
+static int on_off_values[] = {0, 1};
+
+
+/* Main menu tab and game list styles for the Layouts page: the main-menu tabs offer the first
+   MENUSTYLE_MAIN_COUNT (List, Grid, Carousel), game lists all MENUSTYLE_GAMELIST_COUNT (+ Backdrop) */
+static const char* menu_style_labels[] = {"列表", "网格", "轮播", "背景画"};
+static int menu_style_values[] = {MENU_STYLE_LIST, MENU_STYLE_GRID, MENU_STYLE_CAROUSEL, MENU_STYLE_BACKDROP};
+/* Carousel / Backdrop orientation rows: each sits directly under its style row and shows only while that style
+   has an orientation (sync_layouts_rows) */
+static const char* orient_labels[] = {"水平", "垂直"};
+static int orient_values[] = {MENU_ORIENT_HORIZONTAL, MENU_ORIENT_VERTICAL};
+static SettingItem* menu_orient_items[MENU_CAT_COUNT] = {NULL};
+/* Each tab's layout row (and the Consoles background row): shown only while that tab is (sync_layouts_rows) */
+static SettingItem* menu_style_items[MENU_CAT_COUNT] = {NULL};
+static SettingItem* menu_controller_item = NULL;
+static SettingsPage layouts_page; // defined with the page below (sync_layouts_rows clamps its scroll)
+static SettingItem* game_list_orient_item = NULL;
+/* Game lists' Vertical alignment: under their orientation row, shown only while they draw Vertical */
+static const char* valign_labels[] = {"左", "右"};
+static int valign_values[] = {MENU_VALIGN_LEFT, MENU_VALIGN_RIGHT};
+static SettingItem* game_list_valign_item = NULL;
+/* Game lists' List art and Backdrop art: under their alignment row, each shown only while they draw its style */
+static const char* list_art_labels[] = {"截图", "Mix", "3D 盒装封面", "2D 盒装封面", "Logo 轮盘", "无"};
+static int list_art_values[] = {GAME_LIST_ART_SCREENSHOT, GAME_LIST_ART_MIX, GAME_LIST_ART_BOXART3D,
+								GAME_LIST_ART_BOXART2D, GAME_LIST_ART_WHEEL, GAME_LIST_ART_NONE};
+static SettingItem* list_art_item = NULL;
+static const char* backdrop_art_labels[] = {"3D 盒装封面", "2D 盒装封面", "Logo 轮盘"};
+static int backdrop_art_values[] = {BACKDROP_ART_BOXART3D, BACKDROP_ART_BOXART2D, BACKDROP_ART_WHEEL};
+static SettingItem* backdrop_art_item = NULL;
+static const char* hide_show_labels[] = {"隐藏", "显示"};
+/* The Home tab's layout: under the "主界面标签页" row, shown only while the tab is */
+// in the display order of the other tabs' rows (List, Grid, Carousel); the stored values stay as they are
+static const char* home_style_labels[] = {"列表", "网格", "轮播"};
+static int home_style_values[] = {HOME_STYLE_LIST, HOME_STYLE_GRID, HOME_STYLE_CAROUSEL};
+static SettingItem* home_style_item = NULL;
+
+// "震动强度": values are libmsettings rumble_strength levels
+// (vib_levels.h); 0 = Normal is the default and sits in the middle of the UI.
+static const char* rumble_strength_labels[] = {"轻", "标准", "强"};
+static int rumble_strength_values[] = {VIB_LEVEL_LIGHT, VIB_LEVEL_NORMAL, VIB_LEVEL_STRONG};
+
+static const char* button_layout_labels[] = {"Nintendo", "Xbox"};
+static int button_layout_values[] = {BUTTON_LAYOUT_NINTENDO, BUTTON_LAYOUT_XBOX};
+static const char* hint_labels_labels[] = {"布局字母", "印刷大写"};
+static int hint_labels_values[] = {0, 1};
+// The "提示标签" row only matters under the Xbox layout; hidden otherwise.
+static SettingItem* hint_labels_item = NULL;
+
+// ============================================
+// FN Switch "FN 开启时" arrays
+// ============================================
+
+/* Volume when FN is on: Unchanged, Muted, 5%, 10%, ... 100% (22 entries) */
+#define FN_VOLUME_COUNT 22
+static int fn_volume_values[FN_VOLUME_COUNT];
+static const char* fn_volume_labels[FN_VOLUME_COUNT];
+
+/* Brightness when FN is on: Unchanged, 0-10 (12 entries) */
+#define FN_BRIGHTNESS_COUNT 12
+static int fn_brightness_values[FN_BRIGHTNESS_COUNT];
+static char fn_brightness_label_buf[FN_BRIGHTNESS_COUNT][12];
+static const char* fn_brightness_labels[FN_BRIGHTNESS_COUNT];
+
+/* Color temp when FN is on: Unchanged, 0-40 (42 entries) */
+#define FN_COLORTEMP_COUNT 42
+static int fn_colortemp_values[FN_COLORTEMP_COUNT];
+static char fn_colortemp_label_buf[FN_COLORTEMP_COUNT][12];
+static const char* fn_colortemp_labels[FN_COLORTEMP_COUNT];
+
+/* Contrast when FN is on: Unchanged, -4 to 5 (11 entries) */
+#define FN_CONTRAST_COUNT 11
+static int fn_contrast_values[FN_CONTRAST_COUNT];
+static char fn_contrast_label_buf[FN_CONTRAST_COUNT][12];
+static const char* fn_contrast_labels[FN_CONTRAST_COUNT];
+
+/* Saturation when FN is on: Unchanged, -5 to 5 (12 entries) */
+#define FN_SATURATION_COUNT 12
+static int fn_saturation_values[FN_SATURATION_COUNT];
+static char fn_saturation_label_buf[FN_SATURATION_COUNT][12];
+static const char* fn_saturation_labels[FN_SATURATION_COUNT];
+
+/* Exposure when FN is on: Unchanged, -4 to 5 (11 entries) */
+#define FN_EXPOSURE_COUNT 11
+static int fn_exposure_values[FN_EXPOSURE_COUNT];
+static char fn_exposure_label_buf[FN_EXPOSURE_COUNT][12];
+static const char* fn_exposure_labels[FN_EXPOSURE_COUNT];
+
+// ============================================
+// Timezone arrays (dynamic)
+// ============================================
+
+static char timezones[MAX_TIMEZONES][MAX_TZ_LENGTH];
+static int tz_count = 0;
+static const char** tz_labels = NULL;
+static int* tz_values = NULL;
+
+// ============================================
+// Generate dynamic labels at init
+// ============================================
+
+static void init_dynamic_labels(void) {
+	int i;
+
+	/* Color temperature labels 0-40 */
+	for (i = 0; i < COLORTEMP_LABEL_COUNT; i++) {
+		snprintf(colortemp_label_buf[i], sizeof(colortemp_label_buf[i]), "%d", i);
+		colortemp_labels[i] = colortemp_label_buf[i];
+	}
+
+	/* FN volume: Unchanged, Muted, 5%, 10%, ... 100% */
+	fn_volume_values[0] = (int)SETTINGS_DEFAULT_FN_NO_CHANGE;
+	fn_volume_labels[0] = "保持不变";
+	for (i = 0; i < 21; i++) {
+		fn_volume_values[i + 1] = i;
+		fn_volume_labels[i + 1] = volume_labels[i]; /* reuse: Muted, 5%, 10%, ... 100% */
+	}
+
+	/* FN brightness: Unchanged, 0-10 */
+	fn_brightness_values[0] = (int)SETTINGS_DEFAULT_FN_NO_CHANGE;
+	fn_brightness_labels[0] = "保持不变";
+	for (i = 0; i <= 10; i++) {
+		fn_brightness_values[i + 1] = i;
+		snprintf(fn_brightness_label_buf[i + 1], sizeof(fn_brightness_label_buf[i + 1]), "%d", i);
+		fn_brightness_labels[i + 1] = fn_brightness_label_buf[i + 1];
+	}
+
+	/* FN colortemp: Unchanged, 0-40 */
+	fn_colortemp_values[0] = (int)SETTINGS_DEFAULT_FN_NO_CHANGE;
+	fn_colortemp_labels[0] = "保持不变";
+	for (i = 0; i <= 40; i++) {
+		fn_colortemp_values[i + 1] = i;
+		snprintf(fn_colortemp_label_buf[i + 1], sizeof(fn_colortemp_label_buf[i + 1]), "%d", i);
+		fn_colortemp_labels[i + 1] = fn_colortemp_label_buf[i + 1];
+	}
+
+	/* FN contrast: Unchanged, -4 to 5 */
+	fn_contrast_values[0] = (int)SETTINGS_DEFAULT_FN_NO_CHANGE;
+	fn_contrast_labels[0] = "保持不变";
+	for (i = -4; i <= 5; i++) {
+		int idx = i + 5; /* -4->1, -3->2, ..., 5->10 */
+		fn_contrast_values[idx] = i;
+		snprintf(fn_contrast_label_buf[idx], sizeof(fn_contrast_label_buf[idx]), "%d", i);
+		fn_contrast_labels[idx] = fn_contrast_label_buf[idx];
+	}
+
+	/* FN saturation: Unchanged, -5 to 5 */
+	fn_saturation_values[0] = (int)SETTINGS_DEFAULT_FN_NO_CHANGE;
+	fn_saturation_labels[0] = "保持不变";
+	for (i = -5; i <= 5; i++) {
+		int idx = i + 6; /* -5->1, -4->2, ..., 5->11 */
+		fn_saturation_values[idx] = i;
+		snprintf(fn_saturation_label_buf[idx], sizeof(fn_saturation_label_buf[idx]), "%d", i);
+		fn_saturation_labels[idx] = fn_saturation_label_buf[idx];
+	}
+
+	/* FN exposure: Unchanged, -4 to 5 */
+	fn_exposure_values[0] = (int)SETTINGS_DEFAULT_FN_NO_CHANGE;
+	fn_exposure_labels[0] = "保持不变";
+	for (i = -4; i <= 5; i++) {
+		int idx = i + 5; /* -4->1, -3->2, ..., 5->10 */
+		fn_exposure_values[idx] = i;
+		snprintf(fn_exposure_label_buf[idx], sizeof(fn_exposure_label_buf[idx]), "%d", i);
+		fn_exposure_labels[idx] = fn_exposure_label_buf[idx];
+	}
+
+	/* Timezone labels */
+	TIME_getTimezones(timezones, &tz_count);
+	if (tz_count > 0) {
+		tz_labels = (const char**)calloc(tz_count, sizeof(const char*));
+		tz_values = (int*)calloc(tz_count, sizeof(int));
+		for (i = 0; i < tz_count; i++) {
+			tz_labels[i] = timezones[i];
+			tz_values[i] = i;
+		}
+	}
+}
+
+static void free_dynamic_labels(void) {
+	if (tz_labels) {
+		free(tz_labels);
+		tz_labels = NULL;
+	}
+	if (tz_values) {
+		free(tz_values);
+		tz_values = NULL;
+	}
+}
+
+// ============================================
+// Color index lookup helper
+// ============================================
+
+// ============================================
+// Appearance callbacks
+// ============================================
+
+/* Color 1 - Main Color (presets are 0xRRGGBB; opacity is kept separately) */
+static int get_color1(void) {
+	return (int)RGBA_toRGB(CFG_getColor(1));
+}
+static void set_color1(int val) {
+	CFG_setColor(1, RGBA_withAlpha(RGBA_fromRGB((uint32_t)val), RGBA_a(CFG_getColor(1))));
+}
+static void reset_color1(void) {
+	CFG_setColor(1, CFG_DEFAULT_COLOR1);
+}
+
+/* Color 2 - Primary Accent (presets are 0xRRGGBB; opacity is kept separately) */
+static int get_color2(void) {
+	return (int)RGBA_toRGB(CFG_getColor(2));
+}
+static void set_color2(int val) {
+	CFG_setColor(2, RGBA_withAlpha(RGBA_fromRGB((uint32_t)val), RGBA_a(CFG_getColor(2))));
+}
+static void reset_color2(void) {
+	CFG_setColor(2, CFG_DEFAULT_COLOR2);
+}
+
+/* Color 3 - Secondary Accent (presets are 0xRRGGBB; opacity is kept separately) */
+static int get_color3(void) {
+	return (int)RGBA_toRGB(CFG_getColor(3));
+}
+static void set_color3(int val) {
+	CFG_setColor(3, RGBA_withAlpha(RGBA_fromRGB((uint32_t)val), RGBA_a(CFG_getColor(3))));
+}
+static void reset_color3(void) {
+	CFG_setColor(3, CFG_DEFAULT_COLOR3);
+}
+
+/* Color 6 - Hint Info (presets are 0xRRGGBB; opacity is kept separately) */
+static int get_color6(void) {
+	return (int)RGBA_toRGB(CFG_getColor(6));
+}
+static void set_color6(int val) {
+	CFG_setColor(6, RGBA_withAlpha(RGBA_fromRGB((uint32_t)val), RGBA_a(CFG_getColor(6))));
+}
+static void reset_color6(void) {
+	CFG_setColor(6, CFG_DEFAULT_COLOR6);
+}
+
+/* Color 4 - List Text (presets are 0xRRGGBB; opacity is kept separately) */
+static int get_color4(void) {
+	return (int)RGBA_toRGB(CFG_getColor(4));
+}
+static void set_color4(int val) {
+	CFG_setColor(4, RGBA_withAlpha(RGBA_fromRGB((uint32_t)val), RGBA_a(CFG_getColor(4))));
+}
+static void reset_color4(void) {
+	CFG_setColor(4, CFG_DEFAULT_COLOR4);
+}
+
+/* Color 5 - List Text Selected (presets are 0xRRGGBB; opacity is kept separately) */
+static int get_color5(void) {
+	return (int)RGBA_toRGB(CFG_getColor(5));
+}
+static void set_color5(int val) {
+	CFG_setColor(5, RGBA_withAlpha(RGBA_fromRGB((uint32_t)val), RGBA_a(CFG_getColor(5))));
+}
+static void reset_color5(void) {
+	CFG_setColor(5, CFG_DEFAULT_COLOR5);
+}
+
+/* Color opacity accessors — the RGB preset and the alpha are edited by
+   separate list items, so these touch only the packed alpha byte. */
+static int color_opacity_get(int id) {
+	int pct = RGBA_alphaToPercent(RGBA_a(CFG_getColor(id)));
+	pct = ((pct + 5) / 10) * 10; // snap to the 10% steps offered in the list
+	if (pct < 10)
+		pct = 10;
+	if (pct > 100)
+		pct = 100;
+	return pct;
+}
+static void color_opacity_set(int id, int pct) {
+	CFG_setColor(id, RGBA_withAlpha(CFG_getColor(id), RGBA_percentToAlpha(pct)));
+}
+
+static int get_color1_opacity(void) {
+	return color_opacity_get(1);
+}
+static void set_color1_opacity(int v) {
+	color_opacity_set(1, v);
+}
+static void reset_color1_opacity(void) {
+	color_opacity_set(1, 100);
+}
+static int get_color2_opacity(void) {
+	return color_opacity_get(2);
+}
+static void set_color2_opacity(int v) {
+	color_opacity_set(2, v);
+}
+static void reset_color2_opacity(void) {
+	color_opacity_set(2, 100);
+}
+static int get_color3_opacity(void) {
+	return color_opacity_get(3);
+}
+static void set_color3_opacity(int v) {
+	color_opacity_set(3, v);
+}
+static void reset_color3_opacity(void) {
+	color_opacity_set(3, 100);
+}
+
+/* Show battery percent */
+static int get_show_battery_percent(void) {
+	return CFG_getShowBatteryPercent() ? 1 : 0;
+}
+static void set_show_battery_percent(int v) {
+	CFG_setShowBatteryPercent(v != 0);
+}
+static void reset_show_battery_percent(void) {
+	CFG_setShowBatteryPercent(CFG_DEFAULT_SHOWBATTERYPERCENT);
+}
+
+/* Show search hint */
+static int get_show_search_hint(void) {
+	return CFG_getShowSearchHint() ? 1 : 0;
+}
+static void set_show_search_hint(int v) {
+	CFG_setShowSearchHint(v != 0);
+}
+static void reset_show_search_hint(void) {
+	CFG_setShowSearchHint(CFG_DEFAULT_SHOWSEARCHHINT);
+}
+
+/* Show recent hint */
+static int get_show_recent_hint(void) {
+	return CFG_getShowRecentHint() ? 1 : 0;
+}
+static void set_show_recent_hint(int v) {
+	CFG_setShowRecentHint(v != 0);
+}
+static void reset_show_recent_hint(void) {
+	CFG_setShowRecentHint(CFG_DEFAULT_SHOWRECENTHINT);
+}
+
+/* Show netplay hint */
+static int get_show_netplay_hint(void) {
+	return CFG_getShowNetplayHint() ? 1 : 0;
+}
+static void set_show_netplay_hint(int v) {
+	CFG_setShowNetplayHint(v != 0);
+}
+static void reset_show_netplay_hint(void) {
+	CFG_setShowNetplayHint(CFG_DEFAULT_SHOWNETPLAYHINT);
+}
+
+/* Show menu animations */
+static int get_menu_animations(void) {
+	return CFG_getMenuAnimations() ? 1 : 0;
+}
+static void set_menu_animations(int v) {
+	CFG_setMenuAnimations(v != 0);
+}
+static void reset_menu_animations(void) {
+	CFG_setMenuAnimations(CFG_DEFAULT_SHOWMENUANIMATIONS);
+}
+
+/* Show menu transitions */
+static int get_menu_transitions(void) {
+	return CFG_getMenuTransitions() ? 1 : 0;
+}
+static void set_menu_transitions(int v) {
+	CFG_setMenuTransitions(v != 0);
+}
+static void reset_menu_transitions(void) {
+	CFG_setMenuTransitions(CFG_DEFAULT_SHOWMENUTRANSITIONS);
+}
+
+/* Show each orientation row only while its style has an orientation (a main-menu Carousel; a game-list Carousel or
+   Backdrop), the game lists' alignment row only while they draw Vertical, their List art row only while they draw
+   List, their Backdrop art row only while they draw Backdrop, and a tab's layout, orientation and controller rows only
+   while that tab is shown. Each row sits under the row that shows it (its style row, its tab row) and the page
+   selection is a visible index, so a row that appears or disappears under the row being cycled leaves the highlight on
+   that row. */
+static int layouts_rows_shown(void) {
+	int n = game_list_orient_item && game_list_orient_item->visible ? 1 : 0;
+	n += game_list_valign_item && game_list_valign_item->visible ? 1 : 0;
+	n += list_art_item && list_art_item->visible ? 1 : 0;
+	n += backdrop_art_item && backdrop_art_item->visible ? 1 : 0;
+	n += home_style_item && home_style_item->visible ? 1 : 0;
+	n += menu_controller_item && menu_controller_item->visible ? 1 : 0;
+	for (int c = 0; c < MENU_CAT_COUNT; c++) {
+		n += menu_orient_items[c] && menu_orient_items[c]->visible ? 1 : 0;
+		n += menu_style_items[c] && menu_style_items[c]->visible ? 1 : 0;
+	}
+	return n;
+}
+
+static bool layouts_tab_shown(int cat) {
+	return cat == MENU_CAT_CONSOLES		 ? CFG_getShowEmulators()
+		   : cat == MENU_CAT_COLLECTIONS ? CFG_getShowCollections()
+										 : CFG_getShowTools();
+}
+
+/* Rows that disappear shorten the page: a window scrolled to its end would end past the last row (an empty slot under
+   it). Moving the window up by the rows gone keeps it within the list (it ended at or before the old last row); the
+   list's own scroll (UI_adjustListScroll) then keeps the highlight in view, which never ends it past the last row
+   either. The page selection is a visible index and a cycled style row's orientation row sits under it, so the
+   highlight stays on that style row. Rows that appear leave no gap: nothing to do. */
+static void sync_layouts_rows(void) {
+	int before = layouts_rows_shown();
+	for (int c = 0; c < MENU_CAT_COUNT; c++) {
+		bool tab = layouts_tab_shown(c);
+		if (menu_style_items[c])
+			menu_style_items[c]->visible = tab ? 1 : 0;
+		if (menu_orient_items[c])
+			menu_orient_items[c]->visible = tab && MenuStyle_mainMenuHasOrient(CFG_getMenuStyle(c)) ? 1 : 0;
+	}
+	if (menu_controller_item)
+		menu_controller_item->visible = CFG_getShowEmulators() ? 1 : 0;
+	if (game_list_orient_item)
+		game_list_orient_item->visible = MenuStyle_gameListHasOrient(CFG_getGameListStyle()) ? 1 : 0;
+	if (game_list_valign_item)
+		game_list_valign_item->visible = CFG_getGameListOrientEffective() == MENU_ORIENT_VERTICAL ? 1 : 0;
+	if (list_art_item)
+		list_art_item->visible = CFG_getGameListStyle() == MENU_STYLE_LIST ? 1 : 0;
+	if (backdrop_art_item)
+		backdrop_art_item->visible = CFG_getGameListStyle() == MENU_STYLE_BACKDROP ? 1 : 0;
+	if (home_style_item)
+		home_style_item->visible = CFG_getShowHome() ? 1 : 0;
+	int gone = before - layouts_rows_shown();
+	if (gone > 0 && layouts_page.scroll > 0)
+		layouts_page.scroll = layouts_page.scroll > gone ? layouts_page.scroll - gone : 0;
+}
+
+/* Main menu tab styles and orientations, getter/setter/reset triples per category */
+#define MENU_STYLE_CALLBACKS(_name, _cat)                        \
+	static int get_menu_style_##_name(void) {                    \
+		return CFG_getMenuStyle(_cat);                           \
+	}                                                            \
+	static void set_menu_style_##_name(int v) {                  \
+		CFG_setMenuStyle(_cat, v);                               \
+		sync_layouts_rows();                                     \
+	}                                                            \
+	static void reset_menu_style_##_name(void) {                 \
+		CFG_setMenuStyle(_cat, CFG_DEFAULT_MENUSTYLE_FOR(_cat)); \
+		sync_layouts_rows();                                     \
+	}                                                            \
+	static int get_menu_orient_##_name(void) {                   \
+		return CFG_getMenuOrient(_cat);                          \
+	}                                                            \
+	static void set_menu_orient_##_name(int v) {                 \
+		CFG_setMenuOrient(_cat, v);                              \
+	}                                                            \
+	static void reset_menu_orient_##_name(void) {                \
+		CFG_setMenuOrient(_cat, CFG_DEFAULT_MENUORIENT);         \
+	}
+MENU_STYLE_CALLBACKS(consoles, MENU_CAT_CONSOLES)
+MENU_STYLE_CALLBACKS(collections, MENU_CAT_COLLECTIONS)
+MENU_STYLE_CALLBACKS(tools, MENU_CAT_TOOLS)
+
+/* Game list style and orientation */
+static int get_game_list_style(void) {
+	return CFG_getGameListStyle();
+}
+static void set_game_list_style(int v) {
+	CFG_setGameListStyle(v);
+	sync_layouts_rows();
+}
+static void reset_game_list_style(void) {
+	CFG_setGameListStyle(CFG_DEFAULT_GAMELISTSTYLE);
+	sync_layouts_rows();
+}
+static int get_game_list_orient(void) {
+	return CFG_getGameListOrient();
+}
+static void set_game_list_orient(int v) {
+	CFG_setGameListOrient(v);
+	sync_layouts_rows();
+}
+static void reset_game_list_orient(void) {
+	CFG_setGameListOrient(CFG_DEFAULT_GAMELISTORIENT);
+	sync_layouts_rows();
+}
+static int get_game_list_valign(void) {
+	return CFG_getGameListVAlign();
+}
+static void set_game_list_valign(int v) {
+	CFG_setGameListVAlign(v);
+}
+static void reset_game_list_valign(void) {
+	CFG_setGameListVAlign(CFG_DEFAULT_GAMELISTVALIGN);
+}
+static int get_list_art(void) {
+	return CFG_getGameListArt();
+}
+static void set_list_art(int v) {
+	CFG_setGameListArt(v);
+}
+static void reset_list_art(void) {
+	CFG_setGameListArt(CFG_DEFAULT_GAMELISTART);
+}
+static int get_backdrop_art(void) {
+	return CFG_getBackdropArt();
+}
+static void set_backdrop_art(int v) {
+	CFG_setBackdropArt(v);
+}
+static void reset_backdrop_art(void) {
+	CFG_setBackdropArt(CFG_DEFAULT_BACKDROPART);
+}
+
+/* Show Tools */
+static int get_show_tools(void) {
+	return CFG_getShowTools() ? 1 : 0;
+}
+static void set_show_tools(int v) {
+	CFG_setShowTools(v != 0);
+	sync_layouts_rows();
+}
+static void reset_show_tools(void) {
+	CFG_setShowTools(CFG_DEFAULT_SHOWTOOLS);
+	sync_layouts_rows();
+}
+
+/* Show Home */
+static int get_show_home(void) {
+	return CFG_getShowHome() ? 1 : 0;
+}
+static void set_show_home(int v) {
+	CFG_setShowHome(v != 0);
+	sync_layouts_rows();
+}
+static void reset_show_home(void) {
+	CFG_setShowHome(CFG_DEFAULT_SHOWHOME);
+	sync_layouts_rows();
+}
+
+/* Home layout */
+static int get_home_style(void) {
+	return CFG_getHomeStyle();
+}
+static void set_home_style(int v) {
+	CFG_setHomeStyle(v);
+}
+static void reset_home_style(void) {
+	CFG_setHomeStyle(CFG_DEFAULT_HOMESTYLE);
+}
+
+/* Controller art: what the List draws behind the Consoles tab */
+static const char* console_art_labels[] = {"手柄", "背景", "无"};
+static int console_art_values[] = {CONSOLE_ART_CONTROLLER, CONSOLE_ART_BACKGROUND, CONSOLE_ART_NONE};
+static int get_console_art(void) {
+	return CFG_getConsoleArt();
+}
+static void set_console_art(int v) {
+	CFG_setConsoleArt(v);
+}
+static void reset_console_art(void) {
+	CFG_setConsoleArt(CFG_DEFAULT_CONSOLEART);
+}
+
+/* Extra info */
+static int get_extra_info(void) {
+	return CFG_getExtraInfo() ? 1 : 0;
+}
+static void set_extra_info(int v) {
+	CFG_setExtraInfo(v != 0);
+}
+static void reset_extra_info(void) {
+	CFG_setExtraInfo(CFG_DEFAULT_EXTRAINFO);
+}
+
+/* Game Switcher layout */
+static const char* switcher_layout_labels[] = {"全屏", "列表"};
+static int switcher_layout_values[] = {SWITCHER_LAYOUT_FULL, SWITCHER_LAYOUT_LIST};
+static int get_switcher_layout(void) {
+	return CFG_getSwitcherLayout();
+}
+static void set_switcher_layout(int v) {
+	CFG_setSwitcherLayout(v);
+}
+static void reset_switcher_layout(void) {
+	CFG_setSwitcherLayout(CFG_DEFAULT_SWITCHERLAYOUT);
+}
+
+/* Page title */
+static int get_page_title(void) {
+	return CFG_getPageTitle() ? 1 : 0;
+}
+static void set_page_title(int v) {
+	CFG_setPageTitle(v != 0);
+}
+static void reset_page_title(void) {
+	CFG_setPageTitle(CFG_DEFAULT_PAGETITLE);
+}
+
+/* Button hints */
+static int get_button_hints(void) {
+	return CFG_getButtonHints() ? 1 : 0;
+}
+static void set_button_hints(int v) {
+	CFG_setButtonHints(v != 0);
+}
+static void reset_button_hints(void) {
+	CFG_setButtonHints(CFG_DEFAULT_BUTTONHINTS);
+}
+
+/* Show collection */
+static int get_show_collections(void) {
+	return CFG_getShowCollections() ? 1 : 0;
+}
+static void set_show_collections(int v) {
+	CFG_setShowCollections(v != 0);
+	sync_layouts_rows();
+}
+static void reset_show_collections(void) {
+	CFG_setShowCollections(CFG_DEFAULT_SHOWCOLLECTIONS);
+	sync_layouts_rows();
+}
+
+/* Show emulator folders*/
+static int get_show_emulators(void) {
+	return CFG_getShowEmulators() ? 1 : 0;
+}
+static void set_show_emulators(int v) {
+	CFG_setShowEmulators(v != 0);
+	sync_layouts_rows();
+}
+static void reset_show_emulators(void) {
+	CFG_setShowEmulators(CFG_DEFAULT_SHOWEMULATORS);
+	sync_layouts_rows();
+}
+
+
+// ============================================
+// Display callbacks
+// ============================================
+
+static int get_brightness(void) {
+	return GetBrightness();
+}
+static void set_brightness(int v) {
+	SetBrightness(v);
+}
+static void reset_brightness(void) {
+	SetBrightness(SETTINGS_DEFAULT_BRIGHTNESS);
+}
+
+static int get_colortemp(void) {
+	return GetColortemp();
+}
+static void set_colortemp(int v) {
+	SetColortemp(v);
+}
+static void reset_colortemp(void) {
+	SetColortemp(SETTINGS_DEFAULT_COLORTEMP);
+}
+
+static int get_contrast(void) {
+	return GetContrast();
+}
+static void set_contrast(int val) {
+	SetContrast(val);
+}
+static void reset_contrast(void) {
+	SetContrast(SETTINGS_DEFAULT_CONTRAST);
+}
+
+static int get_saturation(void) {
+	return GetSaturation();
+}
+static void set_saturation(int val) {
+	SetSaturation(val);
+}
+static void reset_saturation(void) {
+	SetSaturation(SETTINGS_DEFAULT_SATURATION);
+}
+
+static int get_exposure(void) {
+	return GetExposure();
+}
+static void set_exposure(int val) {
+	SetExposure(val);
+}
+static void reset_exposure(void) {
+	SetExposure(SETTINGS_DEFAULT_EXPOSURE);
+}
+
+// ============================================
+// System callbacks
+// ============================================
+
+
+static int get_screen_timeout(void) {
+	return (int)CFG_getScreenTimeoutSecs();
+}
+static void set_screen_timeout(int val) {
+	CFG_setScreenTimeoutSecs((uint32_t)val);
+}
+static void reset_screen_timeout(void) {
+	CFG_setScreenTimeoutSecs(CFG_DEFAULT_SCREENTIMEOUTSECS);
+}
+
+static int get_suspend_timeout(void) {
+	return (int)CFG_getSuspendTimeoutSecs();
+}
+static void set_suspend_timeout(int val) {
+	CFG_setSuspendTimeoutSecs((uint32_t)val);
+}
+static void reset_suspend_timeout(void) {
+	CFG_setSuspendTimeoutSecs(CFG_DEFAULT_SUSPENDTIMEOUTSECS);
+}
+
+static int get_haptics(void) {
+	return CFG_getHaptics() ? 1 : 0;
+}
+static void set_haptics(int v) {
+	CFG_setHaptics(v != 0);
+}
+static void reset_haptics(void) {
+	CFG_setHaptics(CFG_DEFAULT_HAPTICS);
+}
+
+static void sync_hint_labels_visibility(void) {
+	if (hint_labels_item)
+		hint_labels_item->visible = (CFG_getButtonLayout() == BUTTON_LAYOUT_XBOX) ? 1 : 0;
+}
+static int get_button_layout(void) {
+	return CFG_getButtonLayout();
+}
+static void set_button_layout(int v) {
+	CFG_setButtonLayout(v);
+	sync_hint_labels_visibility();
+	PAD_reloadHintLabels();
+}
+static void reset_button_layout(void) {
+	CFG_setButtonLayout(CFG_DEFAULT_BUTTON_LAYOUT);
+	sync_hint_labels_visibility();
+	PAD_reloadHintLabels();
+}
+static int get_hint_labels(void) {
+	return CFG_getHintLabels() ? 1 : 0;
+}
+static void set_hint_labels(int v) {
+	CFG_setHintLabels(v != 0);
+	PAD_reloadHintLabels();
+}
+static void reset_hint_labels(void) {
+	CFG_setHintLabels(CFG_DEFAULT_HINT_LABELS);
+	PAD_reloadHintLabels();
+}
+
+static int get_rumble_strength(void) {
+	return GetRumbleStrength();
+}
+static void set_rumble_strength(int level) {
+	SetRumbleStrength(level);
+	VIB_previewStrength(); // let the user feel the level they just picked
+}
+static void reset_rumble_strength(void) {
+	SetRumbleStrength(VIB_LEVEL_NORMAL);
+	VIB_previewStrength();
+}
+
+static int get_default_view(void) {
+	return CFG_getDefaultView();
+}
+static void set_default_view(int val) {
+	CFG_setDefaultView(val);
+}
+static void reset_default_view(void) {
+	CFG_setDefaultView(CFG_DEFAULT_VIEW);
+}
+
+static int get_switcher_resumable_only(void) {
+	return CFG_getGameSwitcherResumableOnly() ? 1 : 0;
+}
+static void set_switcher_resumable_only(int v) {
+	CFG_setGameSwitcherResumableOnly(v != 0);
+}
+static void reset_switcher_resumable_only(void) {
+	CFG_setGameSwitcherResumableOnly(CFG_DEFAULT_GAMESWITCHERRESUMABLEONLY);
+}
+
+static int get_clock24h(void) {
+	return CFG_getClock24H() ? 1 : 0;
+}
+static void set_clock24h(int v) {
+	CFG_setClock24H(v != 0);
+}
+static void reset_clock24h(void) {
+	CFG_setClock24H(CFG_DEFAULT_CLOCK24H);
+}
+
+static int get_show_clock(void) {
+	return CFG_getShowClock() ? 1 : 0;
+}
+static void set_show_clock(int v) {
+	CFG_setShowClock(v != 0);
+}
+static void reset_show_clock(void) {
+	CFG_setShowClock(CFG_DEFAULT_SHOWCLOCK);
+}
+
+static int get_ntp(void) {
+	return TIME_getNetworkTimeSync() ? 1 : 0;
+}
+static void set_ntp(int v) {
+	TIME_setNetworkTimeSync(v != 0);
+}
+static void reset_ntp(void) {
+	TIME_setNetworkTimeSync(false);
+}
+
+static int get_timezone(void) {
+	char* current = TIME_getCurrentTimezone();
+	if (!current)
+		return 0;
+	int result = 0;
+	for (int i = 0; i < tz_count; i++) {
+		if (strcmp(timezones[i], current) == 0) {
+			result = i;
+			break;
+		}
+	}
+	free(current);
+	return result;
+}
+static void set_timezone(int idx) {
+	if (idx >= 0 && idx < tz_count)
+		TIME_setCurrentTimezone(timezones[idx]);
+}
+static void reset_timezone(void) {
+	TIME_setCurrentTimezone("Asia/Shanghai");
+}
+
+static int get_save_format(void) {
+	return CFG_getSaveFormat();
+}
+static void set_save_format(int val) {
+	CFG_setSaveFormat(val);
+}
+static void reset_save_format(void) {
+	CFG_setSaveFormat(CFG_DEFAULT_SAVEFORMAT);
+}
+
+static int get_state_format(void) {
+	return CFG_getStateFormat();
+}
+static void set_state_format(int val) {
+	CFG_setStateFormat(val);
+}
+static void reset_state_format(void) {
+	CFG_setStateFormat(CFG_DEFAULT_STATEFORMAT);
+}
+
+static int get_use_extracted_filename(void) {
+	return CFG_getUseExtractedFileName() ? 1 : 0;
+}
+static void set_use_extracted_filename(int v) {
+	CFG_setUseExtractedFileName(v != 0);
+}
+static void reset_use_extracted_filename(void) {
+	CFG_setUseExtractedFileName(CFG_DEFAULT_EXTRACTEDFILENAME);
+}
+
+static int get_power_off_protection(void) {
+	return CFG_getPowerOffProtection() ? 1 : 0;
+}
+static void set_power_off_protection(int v) {
+	CFG_setPowerOffProtection(v != 0);
+}
+static void reset_power_off_protection(void) {
+	CFG_setPowerOffProtection(CFG_DEFAULT_POWEROFFPROTECTION);
+}
+
+static int get_fan_speed(void) {
+	return GetFanSpeed();
+}
+static void set_fan_speed(int val) {
+	SetFanSpeed(val);
+}
+static void reset_fan_speed(void) {
+	SetFanSpeed(SETTINGS_DEFAULT_FAN_SPEED);
+}
+
+// ============================================
+// FN Switch callbacks
+// ============================================
+
+static int get_fn_volume(void) {
+	return GetFnVolume();
+}
+static void set_fn_volume(int val) {
+	SetFnVolume(val);
+}
+static void reset_fn_volume(void) {
+	SetFnVolume(0);
+}
+
+static int get_fn_leds(void) {
+	return CFG_getFnLEDs() ? 1 : 0;
+}
+static void set_fn_leds(int v) {
+	CFG_setFnLEDs(v != 0);
+}
+static void reset_fn_leds(void) {
+	CFG_setFnLEDs(CFG_DEFAULT_FNLEDS);
+}
+
+static int get_fn_brightness(void) {
+	return GetFnBrightness();
+}
+static void set_fn_brightness(int val) {
+	SetFnBrightness(val);
+}
+static void reset_fn_brightness(void) {
+	SetFnBrightness(SETTINGS_DEFAULT_FN_NO_CHANGE);
+}
+
+static int get_fn_colortemp(void) {
+	return GetFnColortemp();
+}
+static void set_fn_colortemp(int val) {
+	SetFnColortemp(val);
+}
+static void reset_fn_colortemp(void) {
+	SetFnColortemp(SETTINGS_DEFAULT_FN_NO_CHANGE);
+}
+
+static int get_fn_contrast(void) {
+	return GetFnContrast();
+}
+static void set_fn_contrast(int val) {
+	SetFnContrast(val);
+}
+static void reset_fn_contrast(void) {
+	SetFnContrast(SETTINGS_DEFAULT_FN_NO_CHANGE);
+}
+
+static int get_fn_saturation(void) {
+	return GetFnSaturation();
+}
+static void set_fn_saturation(int val) {
+	SetFnSaturation(val);
+}
+static void reset_fn_saturation(void) {
+	SetFnSaturation(SETTINGS_DEFAULT_FN_NO_CHANGE);
+}
+
+static int get_fn_exposure(void) {
+	return GetFnExposure();
+}
+static void set_fn_exposure(int val) {
+	SetFnExposure(val);
+}
+static void reset_fn_exposure(void) {
+	SetFnExposure(SETTINGS_DEFAULT_FN_NO_CHANGE);
+}
+
+// ============================================
+// Notification callbacks
+// ============================================
+
+static int get_notify_save(void) {
+	return CFG_getNotifyManualSave() ? 1 : 0;
+}
+static void set_notify_save(int v) {
+	CFG_setNotifyManualSave(v != 0);
+}
+static void reset_notify_save(void) {
+	CFG_setNotifyManualSave(CFG_DEFAULT_NOTIFY_MANUAL_SAVE);
+}
+
+static int get_notify_load(void) {
+	return CFG_getNotifyLoad() ? 1 : 0;
+}
+static void set_notify_load(int v) {
+	CFG_setNotifyLoad(v != 0);
+}
+static void reset_notify_load(void) {
+	CFG_setNotifyLoad(CFG_DEFAULT_NOTIFY_LOAD);
+}
+
+static int get_notify_screenshot(void) {
+	return CFG_getNotifyScreenshot() ? 1 : 0;
+}
+static void set_notify_screenshot(int v) {
+	CFG_setNotifyScreenshot(v != 0);
+}
+static void reset_notify_screenshot(void) {
+	CFG_setNotifyScreenshot(CFG_DEFAULT_NOTIFY_SCREENSHOT);
+}
+
+static int get_notify_adjustments(void) {
+	return CFG_getNotifyAdjustments() ? 1 : 0;
+}
+static void set_notify_adjustments(int v) {
+	CFG_setNotifyAdjustments(v != 0);
+}
+static void reset_notify_adjustments(void) {
+	CFG_setNotifyAdjustments(CFG_DEFAULT_NOTIFY_ADJUSTMENTS);
+}
+
+static int get_notify_duration(void) {
+	return CFG_getNotifyDuration();
+}
+static void set_notify_duration(int val) {
+	CFG_setNotifyDuration(val);
+}
+static void reset_notify_duration(void) {
+	CFG_setNotifyDuration(CFG_DEFAULT_NOTIFY_DURATION);
+}
+
+// ============================================
+// About page static display callbacks
+// ============================================
+
+static char about_nxredux_version[128] = "";
+static char about_release_date[128] = "";
+static char about_platform[128] = "";
+static char about_os_version[128] = "";
+static char about_busybox_version[128] = "";
+
+static const char* get_about_version(void) {
+	return about_nxredux_version;
+}
+static const char* get_about_release_date(void) {
+	return about_release_date;
+}
+static const char* get_about_platform(void) {
+	return about_platform;
+}
+static const char* get_about_os_version(void) {
+	return about_os_version;
+}
+static const char* get_about_busybox(void) {
+	return about_busybox_version;
+}
+// MiSans' license requires the software itself to say it uses MiSans
+static const char* get_about_font(void) {
+	return "MiSans by Xiaomi";
+}
+
+static void init_about_info(void) {
+	/* NxRedux version: read from version.txt and format as "tag (name-hash)" */
+	char version_path[MAX_PATH];
+	snprintf(version_path, sizeof(version_path), "%s/version.txt", ROOT_SYSTEM_PATH);
+	FILE* vf = fopen(version_path, "r");
+	if (vf) {
+		char line_buf[256];
+		char release_name[256] = {0};
+		char build_hash[256] = {0};
+		char build_tag[256] = {0};
+		char commit_date[256] = {0};
+		int line_num = 0;
+		while (fgets(line_buf, sizeof(line_buf), vf) && line_num < 4) {
+			line_num++;
+			int len = (int)strlen(line_buf);
+			while (len > 0 && (line_buf[len - 1] == '\n' || line_buf[len - 1] == '\r'))
+				line_buf[--len] = '\0';
+			if (line_num == 1)
+				strncpy(release_name, line_buf, sizeof(release_name) - 1);
+			else if (line_num == 2)
+				strncpy(build_hash, line_buf, sizeof(build_hash) - 1);
+			else if (line_num == 3)
+				strncpy(build_tag, line_buf, sizeof(build_tag) - 1);
+			else if (line_num == 4)
+				strncpy(commit_date, line_buf, sizeof(commit_date) - 1);
+		}
+		fclose(vf);
+		/* Version: use tag if available, otherwise release name */
+		if (build_tag[0] && strcmp(build_tag, "untagged") != 0)
+			strncpy(about_nxredux_version, build_tag, sizeof(about_nxredux_version) - 1);
+		else
+			strncpy(about_nxredux_version, release_name, sizeof(about_nxredux_version) - 1);
+		about_nxredux_version[sizeof(about_nxredux_version) - 1] = '\0';
+		/* Release date: line 4 is the HEAD commit date (YYYYMMDD) written by the
+		 * top-level Makefile. Older version.txt files lack it, so fall back to
+		 * the date embedded in a dev release name ("NXRedux-20260221"). Tagged
+		 * releases are named after the tag, which carries no date. */
+		const char* date_src = NULL;
+		if (strlen(commit_date) == 8 && strspn(commit_date, "0123456789") == 8) {
+			date_src = commit_date;
+		} else {
+			char* dash = strchr(release_name, '-');
+			if (dash && strlen(dash + 1) >= 8 && strspn(dash + 1, "0123456789") >= 8)
+				date_src = dash + 1;
+		}
+		if (date_src) {
+			snprintf(about_release_date, sizeof(about_release_date),
+					 "%.4s-%.2s-%.2s (%s)", date_src, date_src + 4, date_src + 6, build_hash);
+		} else {
+			snprintf(about_release_date, sizeof(about_release_date), "%s (%s)", release_name, build_hash);
+		}
+	}
+
+	/* Platform */
+	char* model = PLAT_getModel();
+	if (model) {
+		strncpy(about_platform, model, sizeof(about_platform) - 1);
+		about_platform[sizeof(about_platform) - 1] = '\0';
+	}
+
+	/* Stock OS version */
+	PLAT_getOsVersionInfo(about_os_version, sizeof(about_os_version));
+
+	/* BusyBox version */
+	char bb_output[512];
+	if (run_cmd_capture("cat --help 2>&1", bb_output, sizeof(bb_output)) >= 0) {
+		extract_busybox_version(bb_output, about_busybox_version, sizeof(about_busybox_version));
+	}
+	if (!about_busybox_version[0]) {
+		strncpy(about_busybox_version, "未找到 BusyBox 版本。", sizeof(about_busybox_version) - 1);
+	}
+}
+
+// ============================================
+// Menu item arrays (static allocation)
+// ============================================
+
+#define MAX_APPEARANCE_ITEMS 28
+#define MAX_LAYOUTS_ITEMS 28
+#define MAX_DISPLAY_ITEMS 8
+#define MAX_SYSTEM_ITEMS 24
+#define MAX_FN_ITEMS 20
+#define MAX_FNKEY_ITEMS 3
+#define MAX_NOTIFY_ITEMS 8
+#define MAX_ABOUT_ITEMS 8
+#define MAX_SIMPLE_MODE_ITEMS 2
+#define MAX_SHORTCUT_ITEMS (SHORTCUT_COUNT + 1)
+#define MAX_MAIN_ITEMS 18
+
+static SettingItem appearance_items[MAX_APPEARANCE_ITEMS];
+static SettingItem layouts_items[MAX_LAYOUTS_ITEMS];
+static SettingItem display_items[MAX_DISPLAY_ITEMS];
+static SettingItem system_items[MAX_SYSTEM_ITEMS];
+static SettingItem fn_items[MAX_FN_ITEMS];
+static SettingItem fnkey_items[MAX_FNKEY_ITEMS];
+static SettingItem shortcut_items[MAX_SHORTCUT_ITEMS];
+static SettingItem notify_items[MAX_NOTIFY_ITEMS];
+static SettingItem about_items[MAX_ABOUT_ITEMS];
+static SettingItem simple_mode_items[MAX_SIMPLE_MODE_ITEMS];
+static SettingItem main_items[MAX_MAIN_ITEMS];
+
+static SettingsPage appearance_page;
+static SettingsPage layouts_page;
+static SettingsPage display_page;
+static SettingsPage system_page;
+static SettingsPage fn_page;
+static SettingsPage fn_switch_page; /* wraps fn_items into "FN 开关" titled page */
+static SettingsPage fn_keys_page;
+static SettingsPage shortcuts_page;
+static SettingsPage notify_page;
+static SettingsPage about_page;
+static SettingsPage simple_mode_page;
+static SettingsPage main_page;
+
+/* WiFi/BT/LED pages (created upfront in build_menu_tree) */
+static SettingsPage* wifi_page_ptr = NULL;
+static SettingsPage* bt_page_ptr = NULL;
+static SettingsPage* audio_page_ptr = NULL;
+static SettingsPage* led_page_ptr = NULL;
+static SettingsPage* dev_page_ptr = NULL;
+
+static SDL_Surface* g_screen = NULL;
+
+// Blocking PIN dialog on g_screen. Returns true and fills pin_out (5 bytes)
+// on confirm, false on cancel.
+static bool run_pin_dialog(const char* title, const char* error, char* pin_out) {
+	if (!g_screen)
+		return false;
+	return UI_pinModal(g_screen, title, error, pin_out, &app_quit, false, true);
+}
+
+// Blocking confirmation modal on g_screen. A confirms, B cancels.
+static bool run_confirm_dialog(const char* title, const char* subtitle) {
+	if (!g_screen)
+		return false;
+	return UI_confirmModal(g_screen, title, subtitle, &app_quit, false, true);
+}
+
+// Blocking full-screen help for Simple Mode. B closes.
+static void show_simple_mode_help(void) {
+	if (!g_screen)
+		return;
+
+	char* help_text =
+		"简洁模式会隐藏工具标签页，并将游戏内\n"
+		"菜单中的选项替换为重置。\n"
+		"\n"
+		"设置仍保留在主屏幕上，受启用简洁模式\n"
+		"时设置的 PIN 码保护。\n"
+		"\n"
+		"忘记 PIN？删除 SD 卡上的文件：\n"
+		".userdata/shared/enable-simple-mode";
+
+	while (!app_quit) {
+		GFX_startFrame();
+		PAD_poll();
+		if (PAD_justPressed(BTN_B))
+			break;
+		GFX_clear(g_screen);
+		UI_renderMenuBar(g_screen, "设置 | 简洁模式");
+		GFX_blitMessage(font.small, help_text, g_screen,
+						&(SDL_Rect){SCALE1(PADDING), 0,
+									g_screen->w - SCALE1(PADDING * 2), g_screen->h});
+		UI_renderButtonHintBar(g_screen, (char*[]){"B", "关闭", NULL});
+		GFX_flip(g_screen);
+	}
+	PAD_poll();
+	PAD_reset(); // don't leak the close press to the menu underneath
+}
+
+// ============================================
+// Emulator shortcut callbacks
+// ============================================
+
+// minarch reads these at every game launch (common/emu_shortcuts.h); every
+// change is written straight away.
+static int shortcut_labels[SHORTCUT_COUNT];
+static char shortcuts_path[MAX_PATH];
+static int shortcuts_dirty = 0;
+
+static const char* shortcutDisplayName(const char* name); // defined below, near its table
+
+#define SHORTCUT_CAPTURE_MS 5000
+
+static void shortcuts_load(void) {
+	EmuShortcuts_getPath(shortcuts_path, sizeof(shortcuts_path), USERDATA_PATH, getenv("DEVICE"));
+	EmuShortcuts_read(shortcuts_path, shortcut_labels);
+}
+static void shortcuts_save(void) {
+	shortcuts_dirty = 0;
+	if (!EmuShortcuts_write(shortcuts_path, shortcut_labels))
+		LOG_error("Failed to write %s\n", shortcuts_path);
+}
+// LEFT/RIGHT (auto-repeat included) only mark the file dirty; it is written
+// when the page closes or Settings exits, so a held direction doesn't sync the
+// SD card on every step. A capture, a clear or a reset writes right away.
+static void shortcuts_flush(void) {
+	if (shortcuts_dirty)
+		shortcuts_save();
+}
+static void shortcuts_page_hide(SettingsPage* page) {
+	(void)page;
+	shortcuts_flush();
+}
+static int shortcut_get(int id) {
+	return shortcut_labels[id];
+}
+static void shortcut_set(int id, int label) {
+	if (label < 0 || label >= SHORTCUT_LABEL_COUNT)
+		label = 0;
+	if (EmuShortcuts_isReserved(label)) {
+		// step past it the way LEFT/RIGHT (or L1/R1's bigger, wrapping step) came
+		int fwd = (label - shortcut_labels[id] + SHORTCUT_LABEL_COUNT) % SHORTCUT_LABEL_COUNT <= SHORTCUT_LABEL_COUNT / 2;
+		label = (label + (fwd ? 1 : SHORTCUT_LABEL_COUNT - 1)) % SHORTCUT_LABEL_COUNT;
+	}
+	if (shortcut_labels[id] == label)
+		return;
+	shortcut_labels[id] = label;
+	shortcuts_dirty = 1;
+}
+
+// Blocking "press a button" capture, like minarch's in-game binder: the first
+// button pressed (UP..R4) is bound, as MENU+button when MENU is held. B on its
+// own, or SHORTCUT_CAPTURE_MS without a press, cancels.
+static void shortcut_capture(int id) {
+	if (!g_screen)
+		return;
+
+	// holding MENU for a combo outlasts keymon's long press; keep the OSD down
+	touch(OSD_SUPPRESS_PATH);
+	PAD_reset(); // the A that opened the capture is still down
+	uint32_t start = SDL_GetTicks();
+	int label = -1;
+	int reserved = 0; // MENU+SELECT was pressed: say why it didn't bind and keep waiting
+	while (!app_quit) {
+		GFX_startFrame();
+		PAD_poll();
+
+		int menu = PAD_isPressed(BTN_MENU);
+		if (PAD_justPressed(BTN_B) && !menu)
+			break;
+		for (int btn_id = 0; btn_id < SHORTCUT_BUTTON_COUNT; btn_id++) {
+			if (PAD_justPressed(1 << btn_id)) {
+				label = EmuShortcuts_toLabel(btn_id, menu);
+				break;
+			}
+		}
+		if (EmuShortcuts_isReserved(label)) {
+			label = -1;
+			reserved = 1;
+			start = SDL_GetTicks(); // a fresh countdown for the next try
+		}
+		if (label >= 0)
+			break;
+
+		uint32_t elapsed = SDL_GetTicks() - start;
+		if (elapsed >= SHORTCUT_CAPTURE_MS)
+			break;
+
+		char text[256];
+				snprintf(text, sizeof(text),
+								 "%s\n\n%s\n\n%u",
+								 shortcutDisplayName(shortcut_names[id]),
+								 reserved ? "MENU+SELECT 会打开游戏切换器。\n请按其他按键。"
+													: "按一个按键，或按住 MENU\n再按一个按键。",
+								 (unsigned)((SHORTCUT_CAPTURE_MS - elapsed + 999) / 1000));
+		GFX_clear(g_screen);
+		UI_renderMenuBar(g_screen, "设置 | 模拟器快捷键");
+		GFX_blitMessage(font.small, text, g_screen,
+						&(SDL_Rect){SCALE1(PADDING), 0,
+									g_screen->w - SCALE1(PADDING * 2), g_screen->h});
+		UI_renderButtonHintBar(g_screen, (char*[]){"B", "取消", NULL});
+		GFX_flip(g_screen);
+	}
+	unlink(OSD_SUPPRESS_PATH);
+	PAD_poll();
+	PAD_reset(); // don't leak the bound press to the menu underneath
+
+	if (label >= 0) {
+		shortcut_set(id, label);
+		shortcuts_flush();
+	}
+}
+
+// one get/set/clear/capture set per shortcut (the menu callbacks take no argument)
+#define SHORTCUT_CALLBACKS_(id, name)         \
+	static int get_shortcut_##id(void) {      \
+		return shortcut_get(SHORTCUT_##id);   \
+	}                                         \
+	static void set_shortcut_##id(int v) {    \
+		shortcut_set(SHORTCUT_##id, v);       \
+	}                                         \
+	static void clear_shortcut_##id(void) {   \
+		shortcut_set(SHORTCUT_##id, 0);       \
+		shortcuts_flush();                    \
+	}                                         \
+	static void capture_shortcut_##id(void) { \
+		shortcut_capture(SHORTCUT_##id);      \
+	}
+SHORTCUT_LIST(SHORTCUT_CALLBACKS_)
+#undef SHORTCUT_CALLBACKS_
+
+typedef struct ShortcutRow {
+	int (*get)(void);
+	void (*set)(int);
+	void (*clear)(void);
+	void (*capture)(void);
+} ShortcutRow;
+#define SHORTCUT_ROW_(id, name) [SHORTCUT_##id] = {get_shortcut_##id, set_shortcut_##id, clear_shortcut_##id, capture_shortcut_##id},
+static const ShortcutRow shortcut_rows[SHORTCUT_COUNT] = {SHORTCUT_LIST(SHORTCUT_ROW_)};
+#undef SHORTCUT_ROW_
+
+// Display-only Chinese names for the shortcut rows; the names stored in the
+// emu_shortcuts cfg stay English (they are the "bind %s" keys).
+static const struct {
+	const char* key;
+	const char* cn;
+} shortcut_names_cn[] = {
+	{"Save State", "保存即时存档"},
+	{"Load State", "读取即时存档"},
+	{"Undo Load State", "撤销读取存档"},
+	{"Reset Game", "重置游戏"},
+	{"Save & Quit", "保存并退出"},
+	{"Cycle Scaling", "循环切换缩放"},
+	{"Cycle Effect", "循环切换特效"},
+	{"Toggle FF", "切换快进"},
+	{"Hold FF", "按住快进"},
+	{"Toggle Rewind", "切换回溯"},
+	{"Hold Rewind", "按住回溯"},
+	{"Game Switcher", "游戏切换器"},
+	{"Screenshot", "屏幕截图"},
+	{"Toggle Turbo A", "切换连发 A"},
+	{"Toggle Turbo B", "切换连发 B"},
+	{"Toggle Turbo X", "切换连发 X"},
+	{"Toggle Turbo Y", "切换连发 Y"},
+	{"Toggle Turbo L", "切换连发 L"},
+	{"Toggle Turbo L2", "切换连发 L2"},
+	{"Toggle Turbo R", "切换连发 R"},
+	{"Toggle Turbo R2", "切换连发 R2"},
+	{"Toggle D-pad Joystick", "切换方向键摇杆"},
+	{NULL, NULL}};
+static const char* shortcutDisplayName(const char* name) {
+	for (int i = 0; shortcut_names_cn[i].key; i++)
+		if (strcmp(shortcut_names_cn[i].key, name) == 0)
+			return shortcut_names_cn[i].cn;
+	return name;
+}
+static int is_turbo_shortcut(int id) {
+	return id >= SHORTCUT_TOGGLE_TURBO_A && id <= SHORTCUT_TOGGLE_TURBO_R2;
+}
+
+// ============================================
+// Simple Mode callbacks
+// ============================================
+
+static int get_simple_mode(void) {
+	return exists((char*)SIMPLE_MODE_PATH) ? 1 : 0;
+}
+static void set_simple_mode(int v) {
+	if (v) {
+		if (exists((char*)SIMPLE_MODE_PATH))
+			return; // already on
+
+		char pin[PINDIALOG_PIN_LEN + 1];
+		char confirm[PINDIALOG_PIN_LEN + 1];
+		const char* error = NULL;
+		while (1) {
+			if (!run_pin_dialog("设置 PIN", error, pin))
+				return; // cancelled: leave Simple Mode off
+			if (!run_pin_dialog("确认设置 PIN", NULL, confirm))
+				return;
+			if (strcmp(pin, confirm) == 0)
+				break;
+			error = "两次 PIN 不一致，请重试。";
+		}
+		putFile((char*)SIMPLE_MODE_PATH, pin);
+	} else {
+		unlink(SIMPLE_MODE_PATH);
+	}
+}
+static void reset_simple_mode(void) {
+	unlink(SIMPLE_MODE_PATH);
+}
+
+// ============================================
+// F1/F2 key tool shortcuts (Brick family)
+// ============================================
+
+#define MAX_FN_TOOLS 64
+
+typedef struct {
+	char path[256]; // SD-relative, matches what CFG_setFn1Tool stores
+	char name[128]; // pak basename without ".pak"
+} FnTool;
+
+// Slot 0 is "关" (empty path); the rest are the launchable tool paks.
+static FnTool fn_tools[MAX_FN_TOOLS + 1];
+static const char* fn_tool_labels[MAX_FN_TOOLS + 1];
+static int fn_tool_count = 0;
+
+static int fn_tool_cmp(const void* a, const void* b) {
+	return strcasecmp(((const FnTool*)a)->name, ((const FnTool*)b)->name);
+}
+
+static void fn_tools_add(const char* dir, const char* pak_name) {
+	if (fn_tool_count > MAX_FN_TOOLS)
+		return;
+
+	char full[MAX_PATH];
+	snprintf(full, sizeof(full), "%s/%s", dir, pak_name);
+	char launch[MAX_PATH];
+	snprintf(launch, sizeof(launch), "%s/launch.sh", full);
+	if (!exists(launch))
+		return; // only launchable paks are assignable
+
+	FnTool* tool = &fn_tools[fn_tool_count];
+	snprintf(tool->name, sizeof(tool->name), "%s", pak_name);
+	char* dot = strrchr(tool->name, '.');
+	if (dot)
+		*dot = '\0';
+
+	// earlier layers shadow later ones (same rule as nextui's Tools menu)
+	for (int i = 1; i < fn_tool_count; i++) {
+		if (strcmp(fn_tools[i].name, tool->name) == 0)
+			return;
+	}
+
+	snprintf(tool->path, sizeof(tool->path), "%s", full + strlen(SDCARD_PATH));
+	fn_tool_count++;
+}
+
+// Collect the same merged set of tool paks nextui's Tools menu lists: the
+// system paks first, then SD /Tools, then the /Tools/<platform> community-pak
+// subfolder — a name in an earlier layer shadows the later ones (a shipped
+// pak always wins).
+static void fn_tools_scan(void) {
+	fn_tools[0].path[0] = '\0';
+	snprintf(fn_tools[0].name, sizeof(fn_tools[0].name), "%s", "关");
+	fn_tool_count = 1;
+
+	char plat_path[MAX_PATH];
+	snprintf(plat_path, sizeof(plat_path), "%s/" PLATFORM, TOOLS_PATH);
+	char sys_path[MAX_PATH];
+	snprintf(sys_path, sizeof(sys_path), "%s/Tools", PAKS_PATH);
+	const char* dirs[] = {sys_path, TOOLS_PATH, plat_path};
+
+	for (size_t d = 0; d < sizeof(dirs) / sizeof(dirs[0]); d++) {
+		DIR* dh = opendir(dirs[d]);
+		if (!dh)
+			continue;
+		struct dirent* dp;
+		while ((dp = readdir(dh)) != NULL) {
+			if (dp->d_name[0] == '.' || !suffixMatch(".pak", dp->d_name))
+				continue;
+			fn_tools_add(dirs[d], dp->d_name);
+		}
+		closedir(dh);
+	}
+
+	qsort(&fn_tools[1], fn_tool_count - 1, sizeof(FnTool), fn_tool_cmp);
+	for (int i = 0; i < fn_tool_count; i++)
+		fn_tool_labels[i] = fn_tools[i].name;
+}
+
+// Stored path not in the list anymore (tool uninstalled) reads as "关".
+static int fn_tool_index_of(const char* path) {
+	if (path[0]) {
+		for (int i = 1; i < fn_tool_count; i++) {
+			if (strcmp(fn_tools[i].path, path) == 0)
+				return i;
+		}
+	}
+	return 0;
+}
+
+static int get_fn1_tool(void) {
+	return fn_tool_index_of(CFG_getFn1Tool());
+}
+static void set_fn1_tool(int idx) {
+	CFG_setFn1Tool(idx > 0 && idx < fn_tool_count ? fn_tools[idx].path : "");
+}
+static void reset_fn1_tool(void) {
+	CFG_setFn1Tool("");
+}
+
+static int get_fn2_tool(void) {
+	return fn_tool_index_of(CFG_getFn2Tool());
+}
+static void set_fn2_tool(int idx) {
+	CFG_setFn2Tool(idx > 0 && idx < fn_tool_count ? fn_tools[idx].path : "");
+}
+static void reset_fn2_tool(void) {
+	CFG_setFn2Tool("");
+}
+
+static void reset_fn_keys_page(void) {
+	settings_page_reset_all(&fn_keys_page);
+}
+
+// ============================================
+// Reset button callbacks (reference pages)
+// ============================================
+
+// Reset the Layouts page. Defaults can show or hide rows (orientations, a tab's rows) above the selected row, so the
+// highlight is kept on the same item (the "恢复默认设置" row when pressed there) by re-mapping it to its new
+// visible index.
+// When the reset hides that row, the highlight goes to the nearest visible row above it (the first row if none).
+static void reset_layouts_items(void) {
+	SettingItem* sel = settings_page_visible_item(&layouts_page, layouts_page.selected);
+	settings_page_reset_all(&layouts_page); // style and tab resets re-sync the rows they show
+	sync_layouts_rows();
+	if (sel) {
+		int vis = -1;
+		for (int actual = (int)(sel - layouts_page.items); actual >= 0 && vis < 0; actual--)
+			vis = settings_page_actual_to_visible(&layouts_page, actual);
+		layouts_page.selected = vis >= 0 ? vis : 0;
+	}
+	// rows came and went: the old window could now end past the last row (an empty slot under it). From the top,
+	// the list's own scroll (UI_adjustListScroll) brings the highlight into view with the window ending on it at
+	// the latest, never past the last row.
+	layouts_page.scroll = 0;
+}
+static void reset_appearance_page(void) {
+	settings_page_reset_all(&appearance_page);
+}
+static void reset_layouts_page(void) {
+	reset_layouts_items();
+}
+static void reset_display_page(void) {
+	settings_page_reset_all(&display_page);
+}
+static void reset_system_page(void) {
+	settings_page_reset_all(&system_page);
+}
+static void reset_fn_page(void) {
+	settings_page_reset_all(&fn_switch_page);
+}
+static void reset_shortcuts_page(void) {
+	for (int i = 0; i < SHORTCUT_COUNT; i++)
+		shortcut_labels[i] = 0;
+	shortcuts_save(); // one write, not one per row
+	for (int i = 0; i < shortcuts_page.item_count; i++)
+		settings_item_sync(&shortcuts_page.items[i]);
+}
+static void reset_notify_page(void) {
+	settings_page_reset_all(&notify_page);
+}
+
+static SettingItem* refresh_emulist_item = NULL;
+static void refresh_emulist(void) {
+	unlink(EMULIST_CACHE_PATH);
+	unlink(ROMINDEX_CACHE_PATH);
+	if (refresh_emulist_item)
+		refresh_emulist_item->desc = "完成！模拟器列表将在下次启动时刷新。";
+}
+
+static SettingItem* restore_osd_item = NULL;
+
+static void restore_stock_osd(void) {
+	if (!run_confirm_dialog("恢复原厂文件？",
+							"将系统自带 OSD 文件及 NX 开机补丁恢复为出厂状态。"))
+		return;
+
+	const char* device = getenv("DEVICE");
+	if (!device)
+		return;
+	char cmd[MAX_PATH];
+	snprintf(cmd, sizeof(cmd),
+			 "sh \"%s/paks/MinUI.pak/restore-stock-osd.sh\" %s", SYSTEM_PATH, device);
+	int rc = system(cmd);
+	if (restore_osd_item)
+		restore_osd_item->desc = (rc == 0)
+									 ? "完成！原厂文件已恢复。"
+									 : "恢复失败。";
+}
+
+// ============================================
+// Input Tester
+// ============================================
+
+static void launch_input_tester(void) {
+	if (g_screen)
+		input_tester_run(g_screen);
+}
+
+static void launch_clock_adjustment(void) {
+	if (g_screen)
+		clock_adjustment_run(g_screen);
+}
+
+static void launch_bootlogo(void) {
+	if (g_screen)
+		bootlogo_run(g_screen);
+}
+
+// ITEM_*_INIT macros are defined in settings_menu.h
+
+// ============================================
+// Build menu tree
+// ============================================
+
+static void init_page(SettingsPage* page, const char* title, SettingItem* items, int count, int is_list) {
+	memset(page, 0, sizeof(SettingsPage));
+	page->title = title;
+	page->items = items;
+	page->item_count = count;
+	page->selected = 0;
+	page->scroll = 0;
+	page->is_list = is_list;
+	page->on_show = NULL;
+	page->on_hide = NULL;
+	page->on_tick = NULL;
+	page->dynamic_start = -1;
+	page->max_items = count;
+	page->needs_layout = 0;
+}
+
+static void build_menu_tree(const DeviceInfo* dev) {
+	int idx;
+
+	// ============================
+	// Layouts page (main page category)
+	// ============================
+	idx = 0;
+	// Grouped by what they shape: each tab's show row, then its layout, orientation and controller rows (shown only
+	// while the tab is, sync_layouts_rows), then the game lists' rows, then the rows for everything, then the boot view
+	// and the Game Switcher.
+#define LAYOUTS_CYCLE_ROW(_label, _desc, _labels, _count, _values, _get, _set, _reset)                 \
+	do {                                                                                               \
+		layouts_items[idx] =                                                                           \
+			(SettingItem)ITEM_CYCLE_INIT(_label, _desc, _labels, _count, _values, _get, _set, _reset); \
+		layouts_items[idx++].a_cycles = 1; /* A flips it too, as LEFT and RIGHT */                     \
+	} while (0)
+	// Each "<tab> orientation" row sits directly under its layout row (sync_layouts_rows shows it)
+#define LAYOUTS_ORIENT_ROW(_slot, _label, _desc, _get, _set, _reset)                                  \
+	do {                                                                                              \
+		_slot = &layouts_items[idx];                                                                  \
+		LAYOUTS_CYCLE_ROW(_label, _desc, orient_labels, MENU_ORIENT_COUNT, orient_values, _get, _set, \
+						  _reset);                                                                    \
+	} while (0)
+	layouts_items[idx++] = (SettingItem)ITEM_CYCLE_INIT(
+		"主页标签页", "显示主页标签页。没有其他标签页时仍会显示。",
+		hide_show_labels, 2, on_off_values, get_show_home, set_show_home, reset_show_home);
+	home_style_item = &layouts_items[idx];
+	LAYOUTS_CYCLE_ROW(
+		"主页布局",
+		"列表：继续游玩、游戏和工具合为一列。网格：继续游玩与工具并排，游戏在下方。轮播：游戏一行，工具在下方。",
+		home_style_labels, HOME_STYLE_COUNT, home_style_values, get_home_style, set_home_style, reset_home_style);
+
+	layouts_items[idx++] = (SettingItem)ITEM_CYCLE_INIT(
+		"游戏机标签页", "显示游戏机标签页。",
+		hide_show_labels, 2, on_off_values, get_show_emulators, set_show_emulators, reset_show_emulators);
+	menu_style_items[MENU_CAT_CONSOLES] = &layouts_items[idx];
+	layouts_items[idx++] = (SettingItem)ITEM_CYCLE_INIT(
+		"游戏机布局", "游戏机标签页的展示方式。",
+		menu_style_labels, MENUSTYLE_MAIN_COUNT, menu_style_values, get_menu_style_consoles, set_menu_style_consoles, reset_menu_style_consoles);
+	LAYOUTS_ORIENT_ROW(menu_orient_items[MENU_CAT_CONSOLES], "游戏机方向",
+					   "游戏机轮播的方向：横向或纵向。",
+					   get_menu_orient_consoles, set_menu_orient_consoles, reset_menu_orient_consoles);
+	menu_controller_item = &layouts_items[idx];
+	LAYOUTS_CYCLE_ROW(
+		"游戏机手柄图",
+		"列表样式下游戏机标签页背后显示的内容：各游戏机的手柄图、你自己的背景图（bg.png），或不显示。",
+		console_art_labels, CONSOLE_ART_COUNT, console_art_values, get_console_art, set_console_art, reset_console_art);
+
+	layouts_items[idx++] = (SettingItem)ITEM_CYCLE_INIT(
+		"收藏夹标签页", "显示收藏夹标签页。",
+		hide_show_labels, 2, on_off_values, get_show_collections, set_show_collections, reset_show_collections);
+	menu_style_items[MENU_CAT_COLLECTIONS] = &layouts_items[idx];
+	layouts_items[idx++] = (SettingItem)ITEM_CYCLE_INIT(
+		"收藏夹布局", "收藏夹标签页的展示方式。",
+		menu_style_labels, MENUSTYLE_MAIN_COUNT, menu_style_values, get_menu_style_collections, set_menu_style_collections, reset_menu_style_collections);
+	LAYOUTS_ORIENT_ROW(menu_orient_items[MENU_CAT_COLLECTIONS], "收藏夹方向",
+					   "收藏夹轮播的方向：横向或纵向。",
+					   get_menu_orient_collections, set_menu_orient_collections, reset_menu_orient_collections);
+
+	layouts_items[idx++] = (SettingItem)ITEM_CYCLE_INIT(
+		"工具标签页", "显示工具标签页。",
+		hide_show_labels, 2, on_off_values, get_show_tools, set_show_tools, reset_show_tools);
+	menu_style_items[MENU_CAT_TOOLS] = &layouts_items[idx];
+	layouts_items[idx++] = (SettingItem)ITEM_CYCLE_INIT(
+		"工具布局", "工具标签页的展示方式。",
+		menu_style_labels, MENUSTYLE_MAIN_COUNT, menu_style_values, get_menu_style_tools, set_menu_style_tools, reset_menu_style_tools);
+	LAYOUTS_ORIENT_ROW(menu_orient_items[MENU_CAT_TOOLS], "工具方向",
+					   "工具轮播的方向：横向或纵向。",
+					   get_menu_orient_tools, set_menu_orient_tools, reset_menu_orient_tools);
+
+	layouts_items[idx++] = (SettingItem)ITEM_CYCLE_INIT(
+		"游戏列表布局", "游戏机或收藏夹下游戏列表的展示方式。",
+		menu_style_labels, MENUSTYLE_GAMELIST_COUNT, menu_style_values, get_game_list_style, set_game_list_style, reset_game_list_style);
+	LAYOUTS_ORIENT_ROW(game_list_orient_item, "游戏列表方向",
+					   "游戏列表轮播或背景画的方向：横向或纵向。",
+					   get_game_list_orient, set_game_list_orient, reset_game_list_orient);
+	game_list_valign_item = &layouts_items[idx];
+	LAYOUTS_CYCLE_ROW(
+		"游戏列表对齐", "纵向游戏列表靠哪一侧；详细信息显示在另一侧。",
+		valign_labels, MENU_VALIGN_COUNT, valign_values, get_game_list_valign, set_game_list_valign,
+		reset_game_list_valign);
+	list_art_item = &layouts_items[idx];
+	LAYOUTS_CYCLE_ROW(
+		"列表封面",
+		"列表样式背后的封面图。Mix、2D 盒装封面和 Logo 轮盘来自 Artwork Manager > 设置。无 则显示没有封面和背景的普通列表。",
+		list_art_labels, GAME_LIST_ART_COUNT, list_art_values, get_list_art, set_list_art, reset_list_art);
+	backdrop_art_item = &layouts_items[idx];
+	LAYOUTS_CYCLE_ROW(
+		"背景画封面", "背景画一排显示的图片。2D 盒装封面和 Logo 轮盘来自 Artwork Manager > 设置。",
+		backdrop_art_labels, BACKDROP_ART_COUNT, backdrop_art_values, get_backdrop_art, set_backdrop_art,
+		reset_backdrop_art);
+#undef LAYOUTS_ORIENT_ROW
+
+	LAYOUTS_CYCLE_ROW(
+		"额外信息", "游玩时长、成就和主页的月度统计，显示在菜单与游戏切换器中。",
+		hide_show_labels, 2, on_off_values, get_extra_info, set_extra_info, reset_extra_info);
+	LAYOUTS_CYCLE_ROW(
+		"页面标题", "标签页和游戏列表标题。隐藏后仍可用 L1/R1 切换标签页。",
+		hide_show_labels, 2, on_off_values, get_page_title, set_page_title, reset_page_title);
+	LAYOUTS_CYCLE_ROW(
+		"按键提示", "隐藏后，游戏列表与游戏切换器将显示游玩时长与成就。",
+		hide_show_labels, 2, on_off_values, get_button_hints, set_button_hints, reset_button_hints);
+	LAYOUTS_CYCLE_ROW(
+		"默认视图", "开机时显示的初始视图",
+		default_view_labels, DEFAULT_VIEW_COUNT, default_view_values, get_default_view, set_default_view,
+		reset_default_view);
+	LAYOUTS_CYCLE_ROW(
+		"游戏切换器布局",
+		"全屏：一次显示一个游戏的继续画面。列表：以列表显示最近游戏，\n		选中游戏的继续画面衬于其后。",
+		switcher_layout_labels, SWITCHER_LAYOUT_COUNT, switcher_layout_values, get_switcher_layout,
+		set_switcher_layout, reset_switcher_layout);
+	LAYOUTS_CYCLE_ROW(
+		"游戏切换器的游戏", "哪些最近游玩的游戏显示在游戏切换器中。",
+		switcher_games_labels, SWITCHER_GAMES_COUNT, switcher_games_values, get_switcher_resumable_only,
+		set_switcher_resumable_only, reset_switcher_resumable_only);
+#undef LAYOUTS_CYCLE_ROW
+	sync_layouts_rows();
+	layouts_items[idx++] = (SettingItem)ITEM_BUTTON_INIT(
+		"恢复默认设置", "将此菜单中的所有选项恢复为默认值。",
+		reset_layouts_page);
+	init_page(&layouts_page, "设置 | 布局", layouts_items, idx, 0);
+
+	// ============================
+	// Appearance page
+	// ============================
+	idx = 0;
+	// Font selection removed — the UI always uses the MiSans-based font.
+	appearance_items[idx++] = (SettingItem)ITEM_COLOR_INIT(
+		"主颜色", "用于渲染主要界面元素的颜色。",
+		color_labels, COLOR_COUNT, (int*)color_values, get_color1, set_color1, reset_color1);
+	appearance_items[idx++] = (SettingItem)ITEM_CYCLE_INIT(
+		"主颜色不透明度", "数值越低，壁纸越能透过状态栏显示。",
+		opacity_labels, OPACITY_COUNT, (int*)opacity_values, get_color1_opacity, set_color1_opacity, reset_color1_opacity);
+	appearance_items[idx++] = (SettingItem)ITEM_COLOR_INIT(
+		"主强调色", "界面中用于强调重要内容的颜色。",
+		color_labels, COLOR_COUNT, (int*)color_values, get_color2, set_color2, reset_color2);
+	appearance_items[idx++] = (SettingItem)ITEM_CYCLE_INIT(
+		"主强调色不透明度", "数值越低，壁纸越能透过选中项显示。",
+		opacity_labels, OPACITY_COUNT, (int*)opacity_values, get_color2_opacity, set_color2_opacity, reset_color2_opacity);
+	appearance_items[idx++] = (SettingItem)ITEM_COLOR_INIT(
+		"次强调色", "次要高亮颜色。",
+		color_labels, COLOR_COUNT, (int*)color_values, get_color3, set_color3, reset_color3);
+	appearance_items[idx++] = (SettingItem)ITEM_CYCLE_INIT(
+		"次强调色不透明度", "数值越低，壁纸越能透过次要元素显示。",
+		opacity_labels, OPACITY_COUNT, (int*)opacity_values, get_color3_opacity, set_color3_opacity, reset_color3_opacity);
+	appearance_items[idx++] = (SettingItem)ITEM_COLOR_INIT(
+		"提示信息颜色", "按键提示和信息颜色",
+		color_labels, COLOR_COUNT, (int*)color_values, get_color6, set_color6, reset_color6);
+	appearance_items[idx++] = (SettingItem)ITEM_COLOR_INIT(
+		"列表文本", "列表文本颜色",
+		color_labels, COLOR_COUNT, (int*)color_values, get_color4, set_color4, reset_color4);
+	appearance_items[idx++] = (SettingItem)ITEM_COLOR_INIT(
+		"列表选中文本", "选中列表文本的颜色",
+		color_labels, COLOR_COUNT, (int*)color_values, get_color5, set_color5, reset_color5);
+	appearance_items[idx++] = (SettingItem)ITEM_CYCLE_INIT(
+		"显示电池百分比", "在状态栏中显示电池百分比",
+		on_off_labels, 2, on_off_values, get_show_battery_percent, set_show_battery_percent, reset_show_battery_percent);
+	appearance_items[idx++] = (SettingItem)ITEM_CYCLE_INIT(
+		"显示时钟", "在状态栏中显示时钟",
+		on_off_labels, 2, on_off_values, get_show_clock, set_show_clock, reset_show_clock);
+	appearance_items[idx++] = (SettingItem)ITEM_CYCLE_INIT(
+		"使用 24 小时制", "以 24 小时制显示时钟",
+		on_off_labels, 2, on_off_values, get_clock24h, set_clock24h, reset_clock24h);
+	appearance_items[idx++] = (SettingItem)ITEM_CYCLE_INIT(
+		"显示搜索提示", "在主菜单显示 START 搜索按键提示",
+		on_off_labels, 2, on_off_values, get_show_search_hint, set_show_search_hint, reset_show_search_hint);
+	appearance_items[idx++] = (SettingItem)ITEM_CYCLE_INIT(
+		"显示最近游玩提示", "在主菜单显示 SELECT 最近游玩按键提示",
+		on_off_labels, 2, on_off_values, get_show_recent_hint, set_show_recent_hint, reset_show_recent_hint);
+	appearance_items[idx++] = (SettingItem)ITEM_CYCLE_INIT(
+		"显示联机提示", "在游戏列表与搜索中显示 Y 联机按键提示",
+		on_off_labels, 2, on_off_values, get_show_netplay_hint, set_show_netplay_hint, reset_show_netplay_hint);
+	appearance_items[idx++] = (SettingItem)ITEM_CYCLE_INIT(
+		"启用菜单动画", "启用或禁用菜单动画",
+		on_off_labels, 2, on_off_values, get_menu_animations, set_menu_animations, reset_menu_animations);
+	appearance_items[idx++] = (SettingItem)ITEM_CYCLE_INIT(
+		"显示过渡动画", "启用或禁用过渡动画",
+		on_off_labels, 2, on_off_values, get_menu_transitions, set_menu_transitions, reset_menu_transitions);
+	appearance_items[idx++] = (SettingItem)ITEM_BUTTON_INIT(
+		"开机画面", "更改设备开机画面。",
+		launch_bootlogo);
+	appearance_items[idx++] = (SettingItem)ITEM_BUTTON_INIT(
+		"恢复默认设置", "将此菜单中的所有选项恢复为默认值。",
+		reset_appearance_page);
+	init_page(&appearance_page, "设置 | 外观", appearance_items, idx, 0);
+
+	// ============================
+	// Display page
+	// ============================
+	idx = 0;
+	if (has_display_hw(dev)) {
+		display_items[idx++] = (SettingItem)ITEM_CYCLE_INIT(
+			"亮度", "显示亮度（0 到 10）",
+			brightness_labels, BRIGHTNESS_LABEL_COUNT, NULL, get_brightness, set_brightness, reset_brightness);
+
+		if (has_color_temp(dev)) {
+			display_items[idx++] = (SettingItem)ITEM_CYCLE_INIT(
+				"色温", "色温（0 到 40）",
+				colortemp_labels, COLORTEMP_LABEL_COUNT, NULL, get_colortemp, set_colortemp, reset_colortemp);
+		}
+	}
+
+	if (has_contrast_sat(dev)) {
+		display_items[idx++] = (SettingItem)ITEM_CYCLE_INIT(
+			"对比度", "对比度增强（-4 到 5）",
+			contrast_labels, CONTRAST_LABEL_COUNT, contrast_values, get_contrast, set_contrast, reset_contrast);
+		display_items[idx++] = (SettingItem)ITEM_CYCLE_INIT(
+			"饱和度", "饱和度增强（-5 到 5）",
+			saturation_labels, SATURATION_LABEL_COUNT, saturation_values, get_saturation, set_saturation, reset_saturation);
+	}
+
+	if (has_exposure(dev)) {
+		display_items[idx++] = (SettingItem)ITEM_CYCLE_INIT(
+			"曝光", "曝光增强（-4 到 5）",
+			exposure_labels, EXPOSURE_LABEL_COUNT, exposure_values, get_exposure, set_exposure, reset_exposure);
+	}
+
+	display_items[idx++] = (SettingItem)ITEM_BUTTON_INIT(
+		"恢复默认设置", "将此菜单中的所有选项恢复为默认值。",
+		reset_display_page);
+	init_page(&display_page, "设置 | 显示", display_items, idx, 0);
+
+	// ============================
+	// System page
+	// ============================
+	idx = 0;
+	if (has_power_mgmt(dev)) {
+		system_items[idx++] = (SettingItem)ITEM_CYCLE_INIT(
+			"屏幕超时", "屏幕关闭前无操作的时间（0-600 秒）",
+			screen_timeout_labels, SCREEN_TIMEOUT_COUNT, screen_timeout_values, get_screen_timeout, set_screen_timeout, reset_screen_timeout);
+		system_items[idx++] = (SettingItem)ITEM_CYCLE_INIT(
+			"休眠超时", "屏幕关闭后进入休眠的时间（5-600 秒）",
+			sleep_timeout_labels, SLEEP_TIMEOUT_COUNT, sleep_timeout_values, get_suspend_timeout, set_suspend_timeout, reset_suspend_timeout);
+	}
+	system_items[idx++] = (SettingItem)ITEM_CYCLE_INIT(
+		"触觉反馈", "启用或禁用系统中某些操作的触觉反馈",
+		on_off_labels, 2, on_off_values, get_haptics, set_haptics, reset_haptics);
+	system_items[idx++] = (SettingItem)ITEM_CYCLE_INIT(
+		"震动强度", "游戏中马达震动与触觉反馈的强度",
+		rumble_strength_labels, 3, rumble_strength_values, get_rumble_strength, set_rumble_strength, reset_rumble_strength);
+	system_items[idx++] = (SettingItem)ITEM_CYCLE_INIT(
+		"按键布局", "Xbox 布局将 A 放在下方、B 放在右侧。快速菜单（OSD）需重启后生效",
+		button_layout_labels, 2, button_layout_values, get_button_layout, set_button_layout, reset_button_layout);
+	hint_labels_item = &system_items[idx];
+	system_items[idx++] = (SettingItem)ITEM_CYCLE_INIT(
+		"提示标签", "Xbox 布局开启时 A/B/X/Y 提示的显示方式。离开设置后立即生效",
+		hint_labels_labels, 2, hint_labels_values, get_hint_labels, set_hint_labels, reset_hint_labels);
+	sync_hint_labels_visibility();
+	system_items[idx++] = (SettingItem)ITEM_CYCLE_INIT(
+		"自动设置时间日期", "通过 NTP 同步时间（需要联网）",
+		on_off_labels, 2, on_off_values, get_ntp, set_ntp, reset_ntp);
+	system_items[idx++] = (SettingItem)ITEM_BUTTON_INIT(
+		"手动设置时间日期", "使用时钟编辑器调整日期和时间",
+		launch_clock_adjustment);
+
+	if (tz_count > 0) {
+		system_items[idx++] = (SettingItem)ITEM_CYCLE_INIT(
+			"时区", "您的时区",
+			tz_labels, tz_count, tz_values, get_timezone, set_timezone, reset_timezone);
+	}
+
+	system_items[idx++] = (SettingItem)ITEM_CYCLE_INIT(
+		"存档格式", "使用的存档格式。",
+		save_format_labels, SAVE_FORMAT_COUNT, save_format_values, get_save_format, set_save_format, reset_save_format);
+	system_items[idx++] = (SettingItem)ITEM_CYCLE_INIT(
+		"即时存档格式", "使用的即时存档格式。",
+		state_format_labels, STATE_FORMAT_COUNT, state_format_values, get_state_format, set_state_format, reset_state_format);
+	system_items[idx++] = (SettingItem)ITEM_CYCLE_INIT(
+		"使用解压后的文件名", "使用解压后的文件名而非压缩包名。",
+		on_off_labels, 2, on_off_values, get_use_extracted_filename, set_use_extracted_filename, reset_use_extracted_filename);
+
+	if (has_power_mgmt(dev) && (dev->platform == PLAT_TG5040 || dev->platform == PLAT_TG5050)) {
+		system_items[idx++] = (SettingItem)ITEM_CYCLE_INIT(
+			"安全关机", "绕过原厂关机流程，以避开\"limbo bug\"。",
+			on_off_labels, 2, on_off_values, get_power_off_protection, set_power_off_protection, reset_power_off_protection);
+	}
+
+	if (has_stock_osd_restore(dev)) {
+		system_items[idx++] = (SettingItem)ITEM_BUTTON_INIT(
+			"恢复原厂文件", "恢复系统出厂 OSD 文件并撤销 NX 开机补丁（如有）。不影响 NX OSD。",
+			restore_stock_osd);
+		restore_osd_item = &system_items[idx - 1];
+	}
+
+	if (has_active_cooling(dev)) {
+		system_items[idx++] = (SettingItem)ITEM_CYCLE_INIT(
+			"风扇速度", "选择风扇速度百分比（安静/标准/高性能或 0-100%）",
+			fan_speed_labels, FAN_SPEED_COUNT, fan_speed_values, get_fan_speed, set_fan_speed, reset_fan_speed);
+	}
+
+	system_items[idx++] = (SettingItem)ITEM_BUTTON_INIT(
+		"刷新模拟器/游戏列表", "清除缓存的模拟器/游戏列表，下次启动时重新扫描。",
+		refresh_emulist);
+	refresh_emulist_item = &system_items[idx - 1];
+	system_items[idx++] = (SettingItem)ITEM_BUTTON_INIT(
+		"恢复默认设置", "将此菜单中的所有选项恢复为默认值。",
+		reset_system_page);
+	init_page(&system_page, "设置 | 系统", system_items, idx, 0);
+
+	// ============================
+	// FN Switch page
+	// ============================
+	idx = 0;
+	fn_items[idx++] = (SettingItem)ITEM_CYCLE_INIT(
+		"FN 开启时的音量", "扬声器音量（0-20）",
+		fn_volume_labels, FN_VOLUME_COUNT, fn_volume_values, get_fn_volume, set_fn_volume, reset_fn_volume);
+	fn_items[idx++] = (SettingItem)ITEM_CYCLE_INIT(
+		"FN 开关同时关闭灯效", "FN 开关也会关闭灯效",
+		on_off_labels, 2, on_off_values, get_fn_leds, set_fn_leds, reset_fn_leds);
+	fn_items[idx++] = (SettingItem)ITEM_CYCLE_INIT(
+		"FN 开启时的亮度", "显示亮度（0 到 10）",
+		fn_brightness_labels, FN_BRIGHTNESS_COUNT, fn_brightness_values, get_fn_brightness, set_fn_brightness, reset_fn_brightness);
+
+	if (has_fn_switch(dev)) {
+		if (has_color_temp(dev)) {
+			fn_items[idx++] = (SettingItem)ITEM_CYCLE_INIT(
+				"FN 开启时的色温", "色温（0 到 40）",
+				fn_colortemp_labels, FN_COLORTEMP_COUNT, fn_colortemp_values, get_fn_colortemp, set_fn_colortemp, reset_fn_colortemp);
+		}
+		if (has_contrast_sat(dev)) {
+			fn_items[idx++] = (SettingItem)ITEM_CYCLE_INIT(
+				"FN 开启时的对比度", "对比度增强（-4 到 5）",
+				fn_contrast_labels, FN_CONTRAST_COUNT, fn_contrast_values, get_fn_contrast, set_fn_contrast, reset_fn_contrast);
+			fn_items[idx++] = (SettingItem)ITEM_CYCLE_INIT(
+				"FN 开启时的饱和度", "饱和度增强（-5 到 5）",
+				fn_saturation_labels, FN_SATURATION_COUNT, fn_saturation_values, get_fn_saturation, set_fn_saturation, reset_fn_saturation);
+		}
+		if (has_exposure(dev)) {
+			fn_items[idx++] = (SettingItem)ITEM_CYCLE_INIT(
+				"FN 开启时的曝光", "曝光增强（-4 到 5）",
+				fn_exposure_labels, FN_EXPOSURE_COUNT, fn_exposure_values, get_fn_exposure, set_fn_exposure, reset_fn_exposure);
+		}
+	}
+
+	fn_items[idx++] = (SettingItem)ITEM_BUTTON_INIT(
+		"恢复默认设置", "将此菜单中的所有选项恢复为默认值。",
+		reset_fn_page);
+	init_page(&fn_switch_page, "设置 | FN 开关", fn_items, idx, 0);
+
+	// ============================
+	// F1/F2 keys page (Brick family only)
+	// ============================
+	idx = 0;
+	fn_tools_scan();
+	fnkey_items[idx++] = (SettingItem)ITEM_CYCLE_INIT(
+		"F1 启动", "F1 键从主菜单打开的工具。",
+		fn_tool_labels, fn_tool_count, NULL, get_fn1_tool, set_fn1_tool, reset_fn1_tool);
+	fnkey_items[idx++] = (SettingItem)ITEM_CYCLE_INIT(
+		"F2 启动", "F2 键从主菜单打开的工具。",
+		fn_tool_labels, fn_tool_count, NULL, get_fn2_tool, set_fn2_tool, reset_fn2_tool);
+	fnkey_items[idx++] = (SettingItem)ITEM_BUTTON_INIT(
+		"恢复默认设置", "将此菜单中的所有选项恢复为默认值。",
+		reset_fn_keys_page);
+	init_page(&fn_keys_page, "设置 | F1 / F2 键", fnkey_items, idx, 0);
+
+	// ============================
+	// Emulator shortcuts page (global, read by minarch at every launch)
+	// ============================
+	idx = 0;
+	shortcuts_load();
+	for (int i = 0; i < SHORTCUT_COUNT; i++) {
+		if (is_turbo_shortcut(i) && !PLAT_canTurbo())
+			continue;
+		const ShortcutRow* row = &shortcut_rows[i];
+		const char* desc = i == SHORTCUT_TOGGLE_DPAD_JOYSTICK
+							   ? "方向键将驱动左摇杆，再次按下后恢复。\nA：按按键（或 MENU+按键）设置。X：清除。"
+							   : "所有游戏机通用的游戏内快捷键。\nA：按按键（或 MENU+按键）设置。X：清除。";
+		shortcut_items[idx] = (SettingItem)ITEM_CYCLE_INIT(
+			shortcutDisplayName(shortcut_names[i]), desc,
+			(const char**)button_labels, SHORTCUT_LABEL_COUNT, NULL, row->get, row->set, row->clear);
+		shortcut_items[idx].on_press = row->capture;
+		shortcut_items[idx].on_clear = row->clear;
+		idx++;
+	}
+	shortcut_items[idx++] = (SettingItem)ITEM_BUTTON_INIT(
+		"恢复默认设置", "清除所有快捷键。",
+		reset_shortcuts_page);
+	init_page(&shortcuts_page, "设置 | 模拟器快捷键", shortcut_items, idx, 0);
+	shortcuts_page.on_hide = shortcuts_page_hide;
+
+	// ============================
+	// Notifications page
+	// ============================
+	idx = 0;
+	notify_items[idx++] = (SettingItem)ITEM_CYCLE_INIT(
+		"存档", "保存进度时显示通知",
+		on_off_labels, 2, on_off_values, get_notify_save, set_notify_save, reset_notify_save);
+	notify_items[idx++] = (SettingItem)ITEM_CYCLE_INIT(
+		"载入存档", "载入进度时显示通知",
+		on_off_labels, 2, on_off_values, get_notify_load, set_notify_load, reset_notify_load);
+	notify_items[idx++] = (SettingItem)ITEM_CYCLE_INIT(
+		"截图", "截图时显示通知",
+		on_off_labels, 2, on_off_values, get_notify_screenshot, set_notify_screenshot, reset_notify_screenshot);
+	notify_items[idx++] = (SettingItem)ITEM_CYCLE_INIT(
+		"音量/显示调节", "调节音量、亮度、色温时显示浮层指示",
+		on_off_labels, 2, on_off_values, get_notify_adjustments, set_notify_adjustments, reset_notify_adjustments);
+	notify_items[idx++] = (SettingItem)ITEM_CYCLE_INIT(
+		"持续时间", "通知在屏幕上停留的时间",
+		notify_duration_labels, NOTIFY_DURATION_COUNT, notify_duration_values, get_notify_duration, set_notify_duration, reset_notify_duration);
+	notify_items[idx++] = (SettingItem)ITEM_BUTTON_INIT(
+		"恢复默认设置", "将此菜单中的所有选项恢复为默认值。",
+		reset_notify_page);
+	init_page(&notify_page, "设置 | 通知", notify_items, idx, 0);
+
+	// ============================
+	// Simple Mode page
+	// ============================
+	idx = 0;
+	simple_mode_items[idx++] = (SettingItem)ITEM_CYCLE_INIT(
+		"简洁模式", "为儿童或休闲用户启用简洁菜单。",
+		on_off_labels, 2, on_off_values, get_simple_mode, set_simple_mode, reset_simple_mode);
+	simple_mode_items[idx++] = (SettingItem)ITEM_BUTTON_INIT(
+		"功能说明", "说明简洁模式与 PIN 恢复。",
+		show_simple_mode_help);
+	init_page(&simple_mode_page, "设置 | 简洁模式", simple_mode_items, idx, 0);
+
+	// ============================
+	// About page
+	// ============================
+	idx = 0;
+	about_items[idx++] = (SettingItem)ITEM_STATIC_INIT(
+		"NX Redux 版本", "", get_about_version);
+	about_items[idx++] = (SettingItem)ITEM_STATIC_INIT(
+		"发布日期", "", get_about_release_date);
+	about_items[idx++] = (SettingItem)ITEM_STATIC_INIT(
+		"平台", "", get_about_platform);
+	about_items[idx++] = (SettingItem)ITEM_STATIC_INIT(
+		"固件版本",
+		"", get_about_os_version);
+	about_items[idx++] = (SettingItem)ITEM_STATIC_INIT(
+		"BusyBox 版本", "", get_about_busybox);
+	about_items[idx++] = (SettingItem)ITEM_STATIC_INIT(
+		"字体", "第三方许可见 .system/licenses", get_about_font);
+	about_items[idx++] = (SettingItem)ITEM_BUTTON_INIT(
+		"检查更新", "",
+		updater_check_for_updates);
+	init_page(&about_page, "设置 | 关于", about_items, idx, 0);
+	about_page.on_show = updater_about_on_show;
+	about_page.on_tick = updater_about_on_tick;
+
+	// ============================
+	// Main page (category list)
+	// ============================
+	idx = 0;
+	if (has_display_hw(dev) || has_contrast_sat(dev) || has_exposure(dev)) {
+		main_items[idx++] = (SettingItem)ITEM_SUBMENU_INIT(
+			"显示", "", &display_page);
+	}
+	main_items[idx++] = (SettingItem)ITEM_SUBMENU_INIT(
+		"外观", "界面自定义", &appearance_page);
+	main_items[idx++] = (SettingItem)ITEM_SUBMENU_INIT(
+		"布局", "菜单样式、标签页、按键提示与开机视图", &layouts_page);
+	main_items[idx++] = (SettingItem)ITEM_SUBMENU_INIT(
+		"游戏内通知", "即时存档通知", &notify_page);
+
+	if (has_leds(dev)) {
+		led_page_ptr = led_page_create();
+		if (led_page_ptr) {
+			main_items[idx++] = (SettingItem)ITEM_SUBMENU_INIT(
+				"灯光控制", "配置灯效", led_page_ptr);
+		}
+	}
+
+	if (has_wifi(dev)) {
+		wifi_page_ptr = wifi_page_create();
+		if (wifi_page_ptr) {
+			main_items[idx++] = (SettingItem)ITEM_SUBMENU_INIT("网络", "", wifi_page_ptr);
+		}
+	}
+
+	if (has_bluetooth(dev)) {
+		bt_page_ptr = bt_page_create();
+		if (bt_page_ptr) {
+			main_items[idx++] = (SettingItem)ITEM_SUBMENU_INIT("蓝牙", "", bt_page_ptr);
+		}
+	}
+
+	audio_page_ptr = audio_page_create();
+	if (audio_page_ptr) {
+		main_items[idx++] = (SettingItem)ITEM_SUBMENU_INIT(
+			"音频", "输出设备与采样率策略", audio_page_ptr);
+	}
+
+	if (has_fn_switch(dev)) {
+		main_items[idx++] = (SettingItem)ITEM_SUBMENU_INIT(
+			"FN 开关", "FN 开关设置", &fn_switch_page);
+	}
+
+	// Hidden in simple mode along with the shortcuts themselves (they launch
+	// tools, which simple mode hides from the main menu).
+	if (has_fn_keys(dev) && !get_simple_mode()) {
+		main_items[idx++] = (SettingItem)ITEM_SUBMENU_INIT(
+			"F1 / F2 键", "用 F1/F2 键启动工具", &fn_keys_page);
+	}
+
+	// Hidden in simple mode, like the in-game Options it replaces there: a
+	// shortcut bound to A could reset or quit every game.
+	if (!get_simple_mode()) {
+		main_items[idx++] = (SettingItem)ITEM_SUBMENU_INIT(
+			"快捷键", "所有游戏机通用的游戏内快捷键", &shortcuts_page);
+	}
+
+	main_items[idx++] = (SettingItem)ITEM_SUBMENU_INIT(
+		"简洁模式", "为儿童准备的简洁菜单", &simple_mode_page);
+
+	main_items[idx++] = (SettingItem)ITEM_SUBMENU_INIT(
+		"系统", "", &system_page);
+
+	dev_page_ptr = developer_page_create(dev->platform);
+	if (dev_page_ptr) {
+		main_items[idx++] = (SettingItem)ITEM_SUBMENU_INIT(
+			"开发者", "开发者与调试工具", dev_page_ptr);
+	}
+
+	main_items[idx++] = (SettingItem)ITEM_BUTTON_INIT(
+		"按键测试", "测试按键、十字键与摇杆输入",
+		launch_input_tester);
+
+	main_items[idx++] = (SettingItem)ITEM_SUBMENU_INIT(
+		"关于", "", &about_page);
+
+	init_page(&main_page, "设置", main_items, idx, 1);
+
+	// ============================
+	// Sync all CYCLE items
+	// ============================
+	{
+		SettingsPage* pages[] = {
+			&appearance_page, &layouts_page, &display_page, &system_page,
+			&fn_switch_page, &fn_keys_page, &notify_page, &simple_mode_page, &shortcuts_page, NULL};
+		for (int p = 0; pages[p]; p++) {
+			for (int i = 0; i < pages[p]->item_count; i++) {
+				settings_item_sync(&pages[p]->items[i]);
+			}
+		}
+	}
+}
+
+// ============================================
+// Main
+// ============================================
+
+int main(int argc, char* argv[]) {
+	(void)argc;
+	(void)argv;
+	SDL_Surface* screen = GFX_init(MODE_MAIN);
+	g_screen = screen;
+	UI_showSplashScreen(screen, "设置");
+
+	DeviceInfo dev = device_detect();
+
+	char version[128];
+	PLAT_getOsVersionInfo(version, 128);
+	LOG_info("当前为原厂系统版本 %s\n", version);
+
+	InitSettings();
+	PWR_init();
+	VIB_init(); // strength preview + boot-logo error pulse need the motor thread
+	PAD_init();
+	TIME_init();
+
+	setup_signal_handlers();
+
+	/* Generate dynamic label arrays */
+	init_dynamic_labels();
+
+	/* Initialize about info */
+	init_about_info();
+
+	/* Build menu tree */
+	build_menu_tree(&dev);
+
+	/* Set screen pointer on WiFi/BT pages for overlay rendering */
+	if (wifi_page_ptr)
+		wifi_page_ptr->screen = screen;
+	if (bt_page_ptr)
+		bt_page_ptr->screen = screen;
+	if (dev_page_ptr)
+		dev_page_ptr->screen = screen;
+	about_page.screen = screen;
+
+	settings_menu_init();
+	settings_menu_push(&main_page);
+
+	bool quit = false;
+	bool dirty = true;
+	IndicatorType show_setting = INDICATOR_NONE;
+
+	while (!quit && !app_quit) {
+		GFX_startFrame();
+		PAD_poll();
+
+		UI_handleQuitRequest(screen, &quit, &dirty, "退出设置？",
+							 "设置会自动保存");
+		settings_menu_handle_input(&quit, &dirty);
+
+		if (settings_menu_glide_active())
+			dirty = true;
+
+		// TG5050: keyboard may have triggered display recovery
+		{
+			SDL_Surface* ns = DisplayHelper_getReinitScreen();
+			if (ns) {
+				screen = ns;
+				dirty = true;
+			}
+		}
+
+		PWR_update(&dirty, &show_setting, NULL, NULL);
+
+		if (UI_statusBarChanged())
+			dirty = true;
+
+		if (dirty) {
+			GFX_clear(screen);
+			settings_menu_render(screen, show_setting);
+			GFX_flip(screen);
+			dirty = false;
+		} else {
+			GFX_sync();
+		}
+	}
+
+	/* Clear screen to black to avoid visual artifacts on exit */
+	GFX_clear(screen);
+	GFX_flip(screen);
+
+	/* Cleanup */
+	if (led_page_ptr)
+		led_page_destroy(led_page_ptr);
+	if (wifi_page_ptr)
+		wifi_page_destroy(wifi_page_ptr);
+	if (bt_page_ptr)
+		bt_page_destroy(bt_page_ptr);
+	if (audio_page_ptr)
+		audio_page_destroy(audio_page_ptr);
+	if (dev_page_ptr)
+		developer_page_destroy(dev_page_ptr);
+	free_dynamic_labels();
+
+	shortcuts_flush(); // exited straight from the shortcuts page
+	VIB_quit();
+	QuitSettings();
+	PWR_quit();
+	PAD_quit();
+	BT_quit();
+	GFX_quit();
+
+	return EXIT_SUCCESS;
+}

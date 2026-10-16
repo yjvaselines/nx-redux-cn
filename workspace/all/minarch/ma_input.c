@@ -1,0 +1,460 @@
+#include "ma_internal.h"
+#include "utils.h"
+#include "netplay.h"
+#include "ma_input.h"
+#include "ma_core.h"
+#include "ma_menu.h"
+#include "ma_rewind.h"
+#include "ma_config.h"
+#include "netplay_helper.h"
+#include "ma_turbo.h"
+#include "ma_present.h"
+#include "button_layout.h"
+#include "notification.h"
+
+int setFastForward(int enable) {
+	int val = enable ? 1 : 0;
+	fast_forward = val;
+	return val;
+}
+
+static uint32_t buttons = 0; // RETRO_DEVICE_ID_JOYPAD_* buttons
+static TurboState turbo;
+static int ignore_menu = 0;
+static int polled_this_frame = 0;
+int input_positional_faces = 0;
+int input_stick_dpad = 1;
+
+// "Toggle D-pad Joystick" shortcut: the D-pad drives the left stick instead of
+// pressing D-pad buttons. Off at every launch, never saved.
+static int dpad_joystick = 0;
+static int dpad_stick_held = 0; // a D-pad direction is held while dpad_joystick is on
+static int16_t dpad_stick_x = 0;
+static int16_t dpad_stick_y = 0;
+#define BTN_DPAD_ANY (BTN_DPAD_UP | BTN_DPAD_DOWN | BTN_DPAD_LEFT | BTN_DPAD_RIGHT)
+
+// Full deflection per held direction; both axes on a diagonal (libretro: +y is down).
+// A direction that completes a MENU+ shortcut (menu_combo_mask) doesn't move the stick.
+static void Input_updateDpadStick(uint32_t menu_combo_mask) {
+	uint32_t held = 0;
+	if (dpad_joystick) {
+		uint32_t dirs[] = {BTN_DPAD_UP, BTN_DPAD_DOWN, BTN_DPAD_LEFT, BTN_DPAD_RIGHT};
+		for (int i = 0; i < 4; i++)
+			if (PAD_isPressed(dirs[i]) && !(dirs[i] & menu_combo_mask))
+				held |= dirs[i];
+	}
+	dpad_stick_held = held != 0;
+	dpad_stick_x = ((held & BTN_DPAD_RIGHT) ? 0x7FFF : 0) - ((held & BTN_DPAD_LEFT) ? 0x7FFF : 0);
+	dpad_stick_y = ((held & BTN_DPAD_DOWN) ? 0x7FFF : 0) - ((held & BTN_DPAD_UP) ? 0x7FFF : 0);
+}
+
+// A binding's button as read for a positional pak: the logical button that
+// the pad's layout swap turns the bound physical position into (see
+// ButtonLayout_positionalFace). Other buttons, or the Nintendo layout, pass
+// through.
+static int Input_positionalBtn(int btn) {
+	ButtonLayoutFace f;
+	switch (btn) {
+	case BTN_A:
+		f = BL_FACE_A;
+		break;
+	case BTN_B:
+		f = BL_FACE_B;
+		break;
+	case BTN_X:
+		f = BL_FACE_X;
+		break;
+	case BTN_Y:
+		f = BL_FACE_Y;
+		break;
+	default:
+		return btn;
+	}
+	switch (ButtonLayout_positionalFace(f, PAD_layoutIsXbox())) {
+	case BL_FACE_A:
+		return BTN_A;
+	case BL_FACE_B:
+		return BTN_B;
+	case BL_FACE_X:
+		return BTN_X;
+	case BL_FACE_Y:
+		return BTN_Y;
+	default:
+		return btn;
+	}
+}
+
+// Shortcuts that save, load or reset the core run after core.run() returns,
+// not from the input callback: mupen64plus-next polls input on its emulation
+// coroutine, and its retro_serialize() co_switches to that same coroutine
+// until the save is done, so a save from in here never returns.
+#define DEFERRED_MENU_SELECT SHORTCUT_COUNT // the built-in MENU+SELECT Game Switcher combo
+static int deferred_shortcut = -1;
+
+void Input_runDeferredShortcut(void) {
+	int i = deferred_shortcut;
+	if (i < 0)
+		return;
+	deferred_shortcut = -1;
+	switch (i) {
+	case SHORTCUT_SAVE_STATE:
+		newScreenshot = 1;
+		Menu_saveState();
+		break;
+	case SHORTCUT_LOAD_STATE:
+		Menu_loadState();
+		break;
+	case SHORTCUT_UNDO_LOAD_STATE:
+		Menu_undoLoadState();
+		break;
+	case SHORTCUT_RESET_GAME:
+		if (!Multiplayer_isActive()) // a reset on one side desyncs the session
+			Core_reset();
+		break;
+	case SHORTCUT_SAVE_QUIT:
+		Netplay_quitAll();
+		newScreenshot = 1;
+		quit = 1;
+		Menu_saveState();
+		break;
+	case SHORTCUT_GAMESWITCHER:
+	case DEFERRED_MENU_SELECT:
+		Netplay_quitAll();
+		newScreenshot = 1;
+		quit = 1;
+		if (i == DEFERRED_MENU_SELECT)
+			Present_stop(); // the save state reads the frame back
+		Menu_saveState();
+		if (prefixMatch(SDCARD_PATH, game.path))
+			putFile(GAME_SWITCHER_PERSIST_PATH, game.path + strlen(SDCARD_PATH));
+		if (i == DEFERRED_MENU_SELECT)
+			GFX_clear(screen);
+		break;
+	}
+}
+
+void Input_beginFrame(void) {
+	polled_this_frame = 0;
+}
+
+void input_poll_callback(void) {
+	polled_this_frame = 1;
+	PAD_poll();
+
+	IndicatorType show_setting = INDICATOR_NONE;
+	PWR_update(NULL, &show_setting, Menu_beforeSleep, Menu_afterSleep);
+
+	// I _think_ this can stay as is...
+	if (PAD_justPressed(BTN_MENU)) {
+		ignore_menu = 0;
+	}
+	if (PAD_isPressed(BTN_MENU) && (PAD_isPressed(BTN_PLUS) || PAD_isPressed(BTN_MINUS))) {
+		ignore_menu = 1;
+	}
+	if (PAD_isPressed(BTN_MENU) && PAD_isPressed(BTN_SELECT)) {
+		ignore_menu = 1;
+		deferred_shortcut = DEFERRED_MENU_SELECT;
+	}
+
+	rewind_pressed = 0;
+	for (int i = 0; i < SHORTCUT_COUNT; i++) {
+		ButtonMapping* mapping = &config.shortcuts[i];
+		int btn = ButtonMapping_btn(mapping);
+		if (btn == BTN_NONE)
+			continue; // not bound
+		if (!mapping->mod || PAD_isPressed(BTN_MENU)) {
+			// Skip FF/rewind for multiplayer
+			if (i == SHORTCUT_TOGGLE_FF || i == SHORTCUT_HOLD_FF ||
+				i == SHORTCUT_HOLD_REWIND || i == SHORTCUT_TOGGLE_REWIND) {
+				if (Multiplayer_isActive())
+					continue;
+			}
+			if (i == SHORTCUT_TOGGLE_FF) {
+				if (PAD_justPressed(btn)) {
+					ff_toggled = setFastForward(!fast_forward);
+					ff_hold_active = 0;
+					if (ff_toggled && rewind_toggle) {
+						// last toggle wins: disable rewind toggle when FF toggle is enabled
+						rewind_toggle = 0;
+						rewind_pressed = 0;
+						Rewind_sync_encode_state();
+						rewinding = 0;
+					}
+					if (mapping->mod)
+						ignore_menu = 1;
+					break;
+				} else if (PAD_justReleased(btn)) {
+					if (mapping->mod)
+						ignore_menu = 1;
+					break;
+				}
+			} else if (i == SHORTCUT_HOLD_FF) {
+				// don't allow turn off fast_forward with a release of the hold button
+				// if it was initially turned on with the toggle button
+				if (PAD_justPressed(btn) || (!ff_toggled && PAD_justReleased(btn))) {
+					int pressed = PAD_isPressed(btn);
+					fast_forward = setFastForward(pressed);
+					ff_hold_active = pressed ? 1 : 0;
+					if (mapping->mod)
+						ignore_menu = 1; // very unlikely but just in case
+				}
+				if (PAD_justReleased(btn) && ff_toggled) {
+					ff_hold_active = 0;
+				}
+			} else if (i == SHORTCUT_HOLD_REWIND) {
+				rewind_pressed = PAD_isPressed(btn) ? 1 : 0;
+				if (rewind_pressed && ff_toggled && !ff_paused_by_rewind_hold) {
+					ff_paused_by_rewind_hold = 1;
+					fast_forward = setFastForward(0);
+				} else if (!rewind_pressed && ff_paused_by_rewind_hold) {
+					ff_paused_by_rewind_hold = 0;
+					if (ff_toggled)
+						fast_forward = setFastForward(1);
+				}
+				if (mapping->mod && rewind_pressed)
+					ignore_menu = 1;
+			} else if (i == SHORTCUT_TOGGLE_REWIND) {
+				if (PAD_justPressed(btn)) {
+					rewind_toggle = !rewind_toggle;
+					if (rewind_toggle && ff_toggled) {
+						// disable fast forward toggle when rewinding is toggled on
+						ff_toggled = 0;
+						fast_forward = setFastForward(0);
+						ff_paused_by_rewind_hold = 0;
+					}
+					if (mapping->mod)
+						ignore_menu = 1;
+					break;
+				} else if (PAD_justReleased(btn)) {
+					if (mapping->mod)
+						ignore_menu = 1;
+					break;
+				}
+			}
+			// Trimui only
+			else if (PLAT_canTurbo() && i >= SHORTCUT_TOGGLE_TURBO_A && i <= SHORTCUT_TOGGLE_TURBO_R2) {
+				if (PAD_justPressed(btn)) {
+					switch (i) {
+					case SHORTCUT_TOGGLE_TURBO_A:
+						PLAT_toggleTurbo(BTN_ID_A);
+						break;
+					case SHORTCUT_TOGGLE_TURBO_B:
+						PLAT_toggleTurbo(BTN_ID_B);
+						break;
+					case SHORTCUT_TOGGLE_TURBO_X:
+						PLAT_toggleTurbo(BTN_ID_X);
+						break;
+					case SHORTCUT_TOGGLE_TURBO_Y:
+						PLAT_toggleTurbo(BTN_ID_Y);
+						break;
+					case SHORTCUT_TOGGLE_TURBO_L:
+						PLAT_toggleTurbo(BTN_ID_L1);
+						break;
+					case SHORTCUT_TOGGLE_TURBO_L2:
+						PLAT_toggleTurbo(BTN_ID_L2);
+						break;
+					case SHORTCUT_TOGGLE_TURBO_R:
+						PLAT_toggleTurbo(BTN_ID_R1);
+						break;
+					case SHORTCUT_TOGGLE_TURBO_R2:
+						PLAT_toggleTurbo(BTN_ID_R2);
+						break;
+					default:
+						break;
+					}
+					break;
+				} else if (PAD_justReleased(btn)) {
+					break;
+				}
+			} else if (PAD_justPressed(btn)) {
+				switch (i) {
+				case SHORTCUT_SAVE_STATE:
+				case SHORTCUT_LOAD_STATE:
+				case SHORTCUT_UNDO_LOAD_STATE:
+				case SHORTCUT_RESET_GAME:
+				case SHORTCUT_SAVE_QUIT:
+				case SHORTCUT_GAMESWITCHER:
+					if (deferred_shortcut < 0) // the first request wins (MENU+SELECT included)
+						deferred_shortcut = i; // Input_runDeferredShortcut, after core.run()
+					break;
+				case SHORTCUT_SCREENSHOT:
+					Menu_screenshot();
+					break;
+				case SHORTCUT_CYCLE_SCALE:
+					screen_scaling = (screen_scaling + 1) % config.frontend.options[FE_OPT_SCALING].count;
+					Config_syncFrontend(config.frontend.options[FE_OPT_SCALING].key, screen_scaling);
+					break;
+				case SHORTCUT_CYCLE_EFFECT:
+					screen_effect = (screen_effect + 1) % config.frontend.options[FE_OPT_EFFECT].count;
+					Config_syncFrontend(config.frontend.options[FE_OPT_EFFECT].key, screen_effect);
+					break;
+				case SHORTCUT_TOGGLE_DPAD_JOYSTICK:
+					dpad_joystick = !dpad_joystick;
+					Notification_push(NOTIFICATION_SETTING, dpad_joystick ? "方向键：摇杆" : "方向键：方向键", NULL);
+					break;
+				default:
+					break;
+				}
+
+				if (mapping->mod)
+					ignore_menu = 1;
+			}
+		}
+	}
+
+	if (!ignore_menu && PAD_justReleased(BTN_MENU)) {
+		show_menu = 1;
+	}
+
+	// While MENU is held, a button that completes a MENU+ combo (a shortcut, or
+	// SELECT for the Game Switcher) is the frontend's, not the game's: MENU+Y
+	// must not also press C-Down in an N64 game.
+	uint32_t menu_combo_mask = 0;
+	if (PAD_isPressed(BTN_MENU)) {
+		menu_combo_mask = BTN_SELECT;
+		for (int i = 0; i < SHORTCUT_COUNT; i++) {
+			ButtonMapping* mapping = &config.shortcuts[i];
+			int btn = ButtonMapping_btn(mapping);
+			if (mapping->mod && btn != BTN_NONE)
+				menu_combo_mask |= btn;
+		}
+	}
+
+	// Buttons with a turbo flag get their cadence from ma_turbo.c: the stock
+	// daemon's own pulses are too short to sample per frame (upstream #780).
+	uint32_t turbo_mask = PLAT_getTurboButtons();
+	buttons = 0;
+	for (int i = 0; config.controls[i].name; i++) {
+		ButtonMapping* mapping = &config.controls[i];
+		int btn = ButtonMapping_btn(mapping);
+		if (btn == BTN_NONE)
+			continue; // present buttons can still be unbound
+		if (!mapping->mod && (btn & menu_combo_mask))
+			continue;
+		if (input_positional_faces)
+			btn = Input_positionalBtn(btn);
+		if (dpad_joystick && (btn & BTN_DPAD_ANY))
+			continue; // the D-pad is the left stick now (Input_updateDpadStick), and the stick stays a stick
+		if (gamepad_type == 0 && input_stick_dpad) {
+			switch (btn) {
+			case BTN_DPAD_UP:
+				btn = BTN_UP;
+				break;
+			case BTN_DPAD_DOWN:
+				btn = BTN_DOWN;
+				break;
+			case BTN_DPAD_LEFT:
+				btn = BTN_LEFT;
+				break;
+			case BTN_DPAD_RIGHT:
+				btn = BTN_RIGHT;
+				break;
+			}
+		}
+		if ((turbo_mask & btn) && !mapping->mod) {
+			int activity = PAD_isPressed(btn) || PAD_justPressed(btn) || PAD_justReleased(btn);
+			if (Turbo_step(&turbo, __builtin_ctz(btn), activity))
+				buttons |= 1 << mapping->retro;
+			continue;
+		}
+		if (PAD_isPressed(btn) && (!mapping->mod || PAD_isPressed(BTN_MENU))) {
+			buttons |= 1 << mapping->retro;
+			if (mapping->mod)
+				ignore_menu = 1;
+		}
+	}
+	Input_updateDpadStick(menu_combo_mask);
+}
+int16_t input_state_callback(unsigned port, unsigned device, unsigned index, unsigned id) {
+	// libretro requires cores to poll before reading, but not all paths do
+	// (FBNeo's error screen). Poll on the core's behalf so the pad -- and the
+	// MENU button -- keep working; RetroArch does the same.
+	if (!polled_this_frame)
+		input_poll_callback();
+	uint32_t player_buttons = Netplay_getPlayerButtons(port, buttons);
+
+	// Digital joypad inputs
+	if (device == RETRO_DEVICE_JOYPAD && index == 0) {
+		if (id == RETRO_DEVICE_ID_JOYPAD_MASK)
+			return player_buttons;
+		return (player_buttons >> id) & 1;
+	}
+	// Analog sticks: our pad on port 0, or both players' synchronized sticks in netplay
+	else if (device == RETRO_DEVICE_ANALOG) {
+		int16_t sticks[4];
+		Input_getLocalSticks(sticks);
+		int axis = (index == RETRO_DEVICE_INDEX_ANALOG_LEFT ? 0 : 2) + (id == RETRO_DEVICE_ID_ANALOG_X ? 0 : 1);
+		return Netplay_getPlayerAnalog(port, index, id, sticks[axis]);
+	}
+	return 0;
+}
+///////////////////////////////
+
+void Input_init(const struct retro_input_descriptor* vars) {
+	static int input_initialized = 0;
+	if (input_initialized)
+		return;
+
+	config.controls = core_button_mapping[0].name ? core_button_mapping : default_button_mapping;
+
+	puts("---------------------------------");
+
+	const char* core_button_names[RETRO_BUTTON_COUNT] = {0};
+	int present[RETRO_BUTTON_COUNT] = {0};
+	int core_mapped = 0;
+	if (vars) {
+		core_mapped = 1;
+		// identify buttons available in this core
+		for (int i = 0; vars[i].description; i++) {
+			const struct retro_input_descriptor* var = &vars[i];
+			if (var->port != 0 || var->device != RETRO_DEVICE_JOYPAD || var->index != 0)
+				continue;
+
+			// TODO: don't ignore unavailable buttons, just override them to BTN_ID_NONE!
+			if (var->id >= RETRO_BUTTON_COUNT) {
+				//printf("UNAVAILABLE: %s\n", var->description); fflush(stdout);
+				continue;
+			} else {
+				//printf("PRESENT    : %s\n", var->description); fflush(stdout);
+			}
+			present[var->id] = 1;
+			core_button_names[var->id] = var->description;
+		}
+	}
+
+	puts("---------------------------------");
+
+	for (int i = 0; default_button_mapping[i].name; i++) {
+		ButtonMapping* mapping = &default_button_mapping[i];
+		if (core_button_names[mapping->retro])
+			mapping->name = (char*)core_button_names[mapping->retro];
+	}
+
+	puts("---------------------------------");
+
+	for (int i = 0; config.controls[i].name; i++) {
+		ButtonMapping* mapping = &config.controls[i];
+		mapping->default_ = mapping->local;
+
+		// ignore mappings that aren't available in this core
+		if (core_mapped && !present[mapping->retro]) {
+			mapping->ignore = 1;
+			continue;
+		}
+	}
+
+	puts("---------------------------------");
+	input_initialized = 1;
+}
+
+// Expose the current local button bitmask (netplay input sync in minarch.c).
+uint32_t Input_getButtons(void) {
+	return buttons;
+}
+
+void Input_getLocalSticks(int16_t sticks[4]) {
+	sticks[0] = dpad_stick_held ? dpad_stick_x : (int16_t)pad.laxis.x;
+	sticks[1] = dpad_stick_held ? dpad_stick_y : (int16_t)pad.laxis.y;
+	sticks[2] = (int16_t)pad.raxis.x;
+	sticks[3] = (int16_t)pad.raxis.y;
+}

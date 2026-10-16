@@ -1,0 +1,135 @@
+/*
+ * NXRedux GBA Link Module
+ * Implements GBA Wireless Adapter (RFU) emulation over WiFi using libretro netpacket interface
+ *
+ * This module bridges gpSP's built-in RFU emulation with network transport,
+ * enabling Pokemon trading, battles (Union Room), and other wireless features.
+ *
+ * This is separate from netplay (input sync) - it provides wireless adapter
+ * communication for GBA games via gpSP's complete RFU implementation.
+ */
+
+#ifndef GBALINK_H
+#define GBALINK_H
+
+#include <stdint.h>
+#include <stdbool.h>
+#include <stddef.h>
+#include "libretro-common/include/libretro.h"
+
+#define GBALINK_DEFAULT_PORT 55437
+#define GBALINK_DISCOVERY_PORT 55438
+#define GBALINK_PROTOCOL_VERSION 1
+#define GBALINK_MAX_GAME_NAME 64
+#define GBALINK_MAX_HOSTS 8
+
+typedef enum {
+	GBALINK_OFF = 0,
+	GBALINK_HOST,
+	GBALINK_CLIENT
+} GBALinkMode;
+
+typedef enum {
+	GBALINK_CONN_WIFI = 0, // Use existing WiFi network
+	GBALINK_CONN_HOTSPOT   // Create/connect to hotspot
+} GBALinkConnMethod;
+
+typedef enum {
+	GBALINK_STATE_IDLE = 0,
+	GBALINK_STATE_WAITING,	  // Host waiting for client
+	GBALINK_STATE_CONNECTING, // Client connecting to host
+	GBALINK_STATE_CONNECTED,  // Connected and ready for SIO packets
+	GBALINK_STATE_DISCONNECTED,
+	GBALINK_STATE_ERROR
+} GBALinkState;
+
+// Return codes for GBALink_connectToHost
+#define GBALINK_CONNECT_OK 0		   // Connected successfully
+#define GBALINK_CONNECT_ERROR -1	   // Connection failed
+#define GBALINK_CONNECT_NEEDS_RELOAD 1 // Connected but link mode differs, needs game reload
+
+typedef struct {
+	char game_name[GBALINK_MAX_GAME_NAME];
+	char host_ip[16];
+	uint16_t port;
+	uint32_t game_crc;
+	char link_mode[32]; // Host's link mode for compatibility check (e.g., "mul_poke", "rfu")
+} GBALinkHostInfo;
+
+// Initialize/cleanup
+void GBALink_init(void);
+void GBALink_quit(void);
+
+// Check if a core supports GBA Link (RFU/Wireless Adapter)
+// core_name is derived from the .so filename (e.g., "gpsp" from "gpsp_libretro.so")
+// Returns true if supported (gpsp), also sets internal support flag
+bool GBALink_checkCoreSupport(const char* core_name);
+
+// Link mode synchronization - host captures mode, client receives and applies it
+// Called before hosting to capture the current gpsp_serial value
+void GBALink_setLinkMode(const char* mode);
+void GBALink_clearPendingReload(void);	 // Clear pending reload state
+void GBALink_applyPendingLinkMode(void); // Apply pending mode to config
+
+// Connection management
+// If hotspot_ip is NULL, uses WiFi mode. Otherwise, uses hotspot mode with given IP.
+// link_mode is the gpsp_serial value to sync with client (can be NULL)
+// peer_ip (the wizard's NETPLAY_PEER_IP) is the only address accepted; NULL or "" accepts anyone.
+int GBALink_startHost(const char* game_name, uint32_t game_crc, const char* hotspot_ip, const char* link_mode,
+					  const char* peer_ip);
+int GBALink_stopHostFast(void);
+int GBALink_connectToHost(const char* ip, uint16_t port);
+void GBALink_disconnect(void);
+
+// Status queries
+bool GBALink_isConnected(void);
+// USB Cable lockstep follower (client 1) whose leader sent a transfer within
+// GBALINK_FOLLOWER_BUSY_MS: minarch then paces it by the link, not by vsync.
+#define GBALINK_FOLLOWER_BUSY_MS 250
+bool GBALink_lockstepFollowerBusy(void);
+// Lockstep traffic arrived within GBALINK_LOCKSTEP_BUSY_MS (either role):
+// minarch runs the CPU at Performance meanwhile, since the governor would
+// otherwise clock down while gpSP waits for the peer.
+#define GBALINK_LOCKSTEP_BUSY_MS 2000
+bool GBALink_lockstepBusy(void);
+// gpSP's real link cable (lockstep) is in use this session.
+bool GBALink_lockstepLinkInUse(void);
+// The link has no pause: while our menu is open, tell the peer's gpSP to wait
+// for us (hold) instead of reading "no partner" (the game's link error).
+void GBALink_holdLink(bool hold);
+// Any GBA link mode (wireless adapter too): while our menu is open the peer's
+// minarch stops running its game (GBALink_peerPaused) so neither side times
+// out. Also sends GBALink_holdLink. A pause outlasting the cap is ignored.
+#define GBALINK_PEER_PAUSE_MAX_MS 30000 // Leave prompt grace (20 s) + 10 s
+void GBALink_setPaused(bool paused);
+bool GBALink_peerPaused(void);
+
+// Host discovery (for client)
+void GBALink_stopDiscovery(void);
+
+// Netpacket interface callbacks for core
+// These are called when the core registers its netpacket interface
+void GBALink_onNetpacketStart(uint16_t client_id,
+							  retro_netpacket_send_t send_fn,
+							  retro_netpacket_poll_receive_t poll_receive_fn);
+void GBALink_onNetpacketStop(void);
+
+// Called by frontend to provide send/poll functions to core
+// These wrap the network transport layer
+void GBALink_sendPacket(int flags, const void* buf, size_t len, uint16_t client_id);
+void GBALink_pollReceive(void);
+
+// Update function (call periodically for connection handling)
+void GBALink_update(void);
+
+// Set core netpacket callbacks (called by minarch when core registers RETRO_ENVIRONMENT_SET_NETPACKET_INTERFACE)
+void GBALink_setCoreCallbacks(const struct retro_netpacket_callback* callbacks);
+
+// Connection state change notifications (called internally by gbalink)
+void GBALink_notifyConnected(int is_host);
+void GBALink_notifyDisconnected(void);
+
+// Netpacket bridging
+void GBALink_pollAndDeliverPackets(void); // Call each frame before core.run()
+
+#endif /* GBALINK_H */

@@ -1,0 +1,155 @@
+###########################################################
+
+ifeq (,$(PLATFORM))
+PLATFORM=$(UNION_PLATFORM)
+endif
+
+ifeq (,$(PLATFORM))
+$(error please specify PLATFORM, eg. PLATFORM=trimui make)
+endif
+
+ifeq (,$(CROSS_COMPILE))
+$(error missing CROSS_COMPILE for this toolchain)
+endif
+
+###########################################################
+
+include ../../$(PLATFORM)/platform/Makefile.env
+
+SDL?=SDL
+
+###########################################################
+
+TARGET = minarch
+PRODUCT= build/$(PLATFORM)/$(TARGET).elf
+INCDIR = -I. -I./libretro-common/include/ -I../common/ -I../../$(PLATFORM)/platform/ -I../netplay/ -I../usblink/ -I../cores/sio_lockstep/
+include ../common/ui/ui.mk
+SOURCE = $(TARGET).c ma_hwrender.c ma_avinfo.c ma_emutime.c ma_game.c ma_cheats.c ma_cheat_match.c ma_saves.c ma_save_paths.c ma_archive_cache.c ma_rewind.c ma_config.c ma_shaders.c ma_options.c \
+         ma_input.c ma_turbo.c ma_bench.c ma_cpu_profile.c ma_cpu_affinity.c ma_environment.c ma_video.c ma_audio.c ma_core.c ma_menu.c ma_frontend_opts.c ma_runframe.c ma_present.c ma_core_progress.c \
+         ma_opts_schema.c ma_opts_dump.c ../common/cjson/cJSON.c \
+         ../common/scaler.c ../common/utils.c ../common/config.c ../common/api.c ../common/text_shape.c ../common/audio_manager.c ../common/notification.c ../common/emu_shortcuts.c ../common/arcade_names.c $(UI_COMPONENT_SRCS) $(UI_DIR)/ui_list.c ../../$(PLATFORM)/platform/platform.c ../netplay/netplay.c ../netplay/gbalink.c ../netplay/gblink.c ../netplay/network_common.c ../netplay/netplay_helper.c ../netplay/core_netplay.c ../netplay/netplay_boot.c ../netplay/siolink.c ../netplay/siolink_proto.c ../netplay/gbalink_mode.c ../usblink/usblink_state.c
+
+# RA support
+ifneq (,$(filter $(PLATFORM),tg5040 tg5050 my355))
+# RA source files
+SOURCE += ../common/http.c ../common/ra_badges.c ../common/ra_badge_path.c ../common/ra_offline.c ../common/ra_offline_net.c ../common/ra_hash_cache.c ../common/ra_hash_cdreader.c ra_integration.c chd_reader.c
+endif
+
+# Netplay WiFi (hotspot/AP) support.
+# wifi_direct.c provides AP hosting and delegates client ops to the platform
+# WiFi stack (common/generic_wifi.c -> PLAT_wifi*), so it only builds on
+# platforms that ship that stack.
+ifneq (,$(filter $(PLATFORM),tg5040 tg5050))
+SOURCE += ../netplay/wifi_direct.c
+CFLAGS += -DHAS_WIFIMG
+endif
+
+CC = $(CROSS_COMPILE)gcc
+CFLAGS  += $(OPT)
+CFLAGS  += $(INCDIR) -I../../$(PLATFORM)/libmsettings -DPLATFORM=\"$(PLATFORM)\" -std=gnu99
+LDFLAGS	 += -L../../$(PLATFORM)/libmsettings -lmsettings -lsamplerate
+
+ifeq ($(PROFILE), 1)
+CFLAGS  += -pg
+LDFLAGS += -pg
+endif
+
+ifeq ($(GPERFTOOLS), 1)
+CFLAGS  += -g
+LDFLAGS += -lprofiler
+endif
+
+# Rewind support
+LDFLAGS  += -llz4
+
+# SaveRAM support
+LDFLAGS	 +=  -Llibretro-common -lsrm -lzip -lz
+CFLAGS   += -DHAS_SRM
+LDFLAGS +=  -lasound
+
+# RA support: rcheevos and libchdr linking
+ifneq (,$(filter $(PLATFORM),tg5040 tg5050 my355))
+LDFLAGS += -lrcheevos -lchdr
+CFLAGS += -DRC_CLIENT_SUPPORTS_HASH -DHAS_CHEEVOS -DHAS_CHDR
+endif
+
+AR=$(CROSS_COMPILE)ar
+ARFLAGS=rc
+
+BUILD_DATE!=date +%Y.%m.%d
+BUILD_HASH!=cat ../../hash.txt
+CFLAGS += -DBUILD_DATE=\"${BUILD_DATE}\" -DBUILD_HASH=\"${BUILD_HASH}\"
+
+ifneq (,$(filter $(PLATFORM),tg5040 tg5050))
+# Platforms with RA support
+all: clean libretro-common libsrm.a rcheevos libchdr $(PREFIX_LOCAL)/include/msettings.h
+	mkdir -p build/$(PLATFORM)
+	cp -L $(PREFIX)/lib/libsamplerate.so.* build/$(PLATFORM)
+	# This is a bandaid fix, needs to be cleaned up if/when we expand to other platforms.
+ifeq ($(PLATFORM), my355)
+	cp -L $(PREFIX)/lib/libcrypto.so.3 build/$(PLATFORM)
+	cp -L $(PREFIX)/lib/libsqlite3.so build/$(PLATFORM)
+	cp -L $(PREFIX)/lib/libffi.so.7 build/$(PLATFORM)
+	cp -L $(PREFIX)/lib/libtinyalsa.so.2 build/$(PLATFORM)
+endif
+	cp -L $(PREFIX)/lib/libsamplerate.so.0 build/$(PLATFORM)
+	cp -L $(PREFIX)/lib/libzip.so.5 build/$(PLATFORM)
+	cp -L $(PREFIX)/lib/libbz2.so.1.0 build/$(PLATFORM)
+	cp -L $(PREFIX)/lib/liblzma.so.5 build/$(PLATFORM)
+	cp -L $(PREFIX)/lib/libzstd.so.1 build/$(PLATFORM)
+	cp -L $(PREFIX)/lib/liblz4.so.1 build/$(PLATFORM)
+	cp -L libchdr/build/$(PLATFORM)/libchdr.so.0 build/$(PLATFORM)
+	$(CC) $(SOURCE) -o $(PRODUCT) $(CFLAGS) $(LDFLAGS)
+endif
+
+# pinned: unpinned master broke the build 2026-07-31 (upstream moved the
+# deflate backends out of trans_stream_zlib.c into trans_stream_deflate.c);
+# keep OBJECTS below in sync with this pin when bumping it
+LIBRETRO_COMMON_COMMIT = 692124dbd8a0b2f5526b48f3bc2026421754e3c5
+
+libretro-common:
+	git clone https://github.com/libretro/libretro-common
+	cd libretro-common && git checkout $(LIBRETRO_COMMON_COMMIT)
+
+rcheevos: rcheevos/Makefile $(PREFIX_LOCAL)/lib/librcheevos.a
+
+libchdr: libchdr/CMakeLists.txt $(PREFIX_LOCAL)/lib/libchdr.so
+
+rcheevos/Makefile:
+	rm -rf rcheevos
+	mkdir -p rcheevos
+	cp rcheevos.Makefile rcheevos/Makefile
+
+$(PREFIX_LOCAL)/lib/librcheevos.a:
+	cp rcheevos.Makefile rcheevos/Makefile
+	cd rcheevos && make build install PLATFORM=$(PLATFORM)
+
+libchdr/CMakeLists.txt:
+	rm -rf libchdr
+	git clone https://github.com/rtissera/libchdr
+	cp libchdr.Makefile libchdr/Makefile
+
+$(PREFIX_LOCAL)/lib/libchdr.so:
+	cp libchdr.Makefile libchdr/Makefile
+	cd libchdr && make build install PLATFORM=$(PLATFORM)
+  
+$(PREFIX_LOCAL)/include/msettings.h:
+	cd ../../$(PLATFORM)/libmsettings && make
+
+### libsrm stuff
+OBJECTS = streams/rzip_stream.o streams/file_stream.o vfs/vfs_implementation.o file/file_path.o file/file_path_io.o compat/compat_strl.o time/rtime.o string/stdstring.o encodings/encoding_utf.o encodings/encoding_deflate.o streams/trans_stream.o streams/trans_stream_pipe.o streams/trans_stream_zlib.o streams/trans_stream_deflate.o
+
+# no -flto here: the archive persists in the untracked libretro-common/ dir
+# across toolchain-image upgrades, and LTO bytecode is GCC-version-locked —
+# a stale libsrm.a then kills every minarch link with
+# "bytecode stream ... generated with GCC compiler older than X"
+$(OBJECTS) :
+	cd libretro-common && $(CC) $(filter-out -flto,$(CFLAGS)) -DHAVE_ZLIB -c -o $@ $(subst .o,.c,$@) -I include/
+
+libsrm.a: $(OBJECTS)
+	cd libretro-common && $(AR) $(ARFLAGS) $@ $?
+
+clean:
+	rm -f $(PRODUCT)
+	rm -f $(addprefix libretro-common/,$(OBJECTS)) libretro-common/libsrm.a
+	rm -f $(OBJECTS) $(LIBRARY)

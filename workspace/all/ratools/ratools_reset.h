@@ -1,0 +1,18 @@
+#ifndef __RATOOLS_RESET_H__
+#define __RATOOLS_RESET_H__
+
+// Clears account-specific RetroAchievements state: the cached login, per-game
+// session unlock state, and the offline unlock journals (pending + confirmed
+// + last-sync). Game achievement definitions and downloaded badges are KEPT,
+// so switching accounts does not force a full re-download. Use before signing
+// in as a different user.
+void RATReset_clearAccountData(void);
+
+// Full wipe: everything the above clears PLUS the cached game definitions,
+// rom-path records, and fallback badge folder - the whole <.ra> tree. A
+// subsequent online play or prefetch rebuilds it from scratch. What lives in
+// the console folders (Roms/<Folder>/.retroachievements: rom hashes and
+// badges) is kept.
+void RATReset_clearAll(void);
+
+#endif // __RATOOLS_RESET_H__

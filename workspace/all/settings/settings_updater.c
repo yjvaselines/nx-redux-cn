@@ -1,0 +1,1002 @@
+/*
+ * settings_updater.c - System updater for NxRedux Settings
+ *
+ * Checks GitHub for the latest release, compares against the installed
+ * version, and allows the user to download + install updates.
+ *
+ * Single "Updater" item in the About page:
+ *   - "正在获取更新.."           while checking in background
+ *   - "安装更新"  (desc=tag)  when update available, A to install
+ *   - "已是最新版本"  when up to date
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <pthread.h>
+#include "utils.h"
+#include <sys/wait.h>
+
+#include "settings_updater.h"
+#include "settings_menu.h"
+#include "defines.h"
+#include "api.h"
+#include "wifi.h"
+#include "ui_buttonhintbar.h"
+#include "ui_downloadprogress.h"
+#include "ui_menubar.h"
+#include "wget_fetch.h"
+#include "updater_url.h"
+#include <ctype.h>
+#include <signal.h>
+#include <strings.h>
+#include <sys/statvfs.h>
+
+// ============================================
+// Configuration
+// ============================================
+
+#define UPDATER_REPO_OWNER "mohammadsyuhada"
+#define UPDATER_REPO_NAME "nx-redux"
+// Web endpoint that 302-redirects to /releases/tag/<TAG>; unlike
+// api.github.com it is not subject to the 60 req/hour per-IP rate limit.
+#define UPDATER_WEB_LATEST_URL \
+	"https://github.com/" UPDATER_REPO_OWNER "/" UPDATER_REPO_NAME "/releases/latest"
+#define VERSION_FILE_PATH "/mnt/SDCARD/.system/version.txt"
+#define DOWNLOAD_PATH "/mnt/SDCARD/.tmp_update.zip"
+#define EXTRACT_DEST "/mnt/SDCARD/"
+#define UPDATER_7Z "/mnt/SDCARD/.system/shared/bin/7zzs.aarch64"
+// Free space needed before downloading: the release zip and the MinUI.zip
+// unpacked from it sit on the card together (~550 MB), then the next boot
+// unpacks MinUI.zip (~540 MB) while it is still there.
+#define UPDATE_MIN_FREE_MB 1024
+
+// ============================================
+// Device name mapping
+// ============================================
+
+static const char* get_device_name(void) {
+	if (strcmp(PLATFORM, "tg5050") == 0)
+		return "smartpros";
+	char* device = getenv("DEVICE");
+	if (device && strcmp(device, "brick") == 0)
+		return "brick";
+	if (device && strcmp(device, "brickpro") == 0)
+		return "brickpro";
+	return "smartpro";
+}
+
+// Release-asset filename suffix after "NXRedux-<tag>-": one zip per device.
+static const char* get_asset_suffix(void) {
+	static char suffix[80];
+	snprintf(suffix, sizeof(suffix), "%s.zip", get_device_name());
+	return suffix;
+}
+
+// ============================================
+// Release info
+// ============================================
+
+typedef struct {
+	char tag_name[128];
+	char download_url[512];
+	char release_notes[2048];
+	char expected_sha256[80]; // hex SHA-256 from the asset "digest" ("" if none)
+} ReleaseInfo;
+
+// ============================================
+// State
+// ============================================
+
+typedef enum {
+	UPDATE_IDLE,
+	UPDATE_CHECKING,
+	UPDATE_UP_TO_DATE,
+	UPDATE_AVAILABLE,
+	UPDATE_ERROR,
+} UpdateCheckState;
+
+static UpdateCheckState auto_state = UPDATE_IDLE;
+static ReleaseInfo cached_release = {0};
+static char item_label[160] = "Updater";
+static char item_desc[256] = "";
+static char current_tag_cache[128] = "";
+
+// Background check thread
+static pthread_t auto_tid;
+static volatile int auto_done = 0;
+static volatile int auto_success = 0;
+static char auto_tag[128] = "";
+static char auto_error[256] = "";
+
+// ============================================
+// JSON helpers
+// ============================================
+
+
+static const char* find_zip_asset_url(const char* json, const char* asset_suffix, char* out, size_t out_size,
+									  char* digest_out, size_t digest_size) {
+	if (digest_out && digest_size > 0)
+		digest_out[0] = '\0';
+	if (!json || !asset_suffix || !out || out_size == 0)
+		return NULL;
+
+	char suffix[96];
+	snprintf(suffix, sizeof(suffix), "-%s", asset_suffix);
+
+	const char* assets = strstr(json, "\"assets\"");
+	if (!assets)
+		return NULL;
+
+	const char* pos = assets;
+	while ((pos = strstr(pos, "\"browser_download_url\"")) != NULL) {
+		pos = strchr(pos + 21, '"');
+		if (!pos)
+			break;
+
+		if (*(pos - 1) == ':') {
+			// pos points to opening quote of value
+		} else {
+			pos++;
+			while (*pos == ' ' || *pos == ':')
+				pos++;
+			if (*pos != '"')
+				continue;
+		}
+
+		pos++;
+		const char* end = strchr(pos, '"');
+		if (!end)
+			break;
+
+		size_t len = end - pos;
+		size_t suf_len = strlen(suffix);
+		if (len > suf_len && strncmp(end - suf_len, suffix, suf_len) == 0) {
+			if (len >= out_size)
+				len = out_size - 1;
+			strncpy(out, pos, len);
+			out[len] = '\0';
+
+			// Extract this asset's SHA-256 digest if present. GitHub emits
+			// "digest": "sha256:<hex>" earlier in the same asset object, so
+			// scan backward from the matched URL. Stop at the first '}' so we
+			// never pick up a different asset's digest.
+			if (digest_out && digest_size > 0) {
+				for (const char* q = pos; q > assets; q--) {
+					if (*q == '}')
+						break;
+					if (strncmp(q, "\"digest\"", 8) == 0) {
+						const char* s = strstr(q, "sha256:");
+						if (s && s < pos) {
+							s += 7;
+							size_t k = 0;
+							while (k < digest_size - 1 && isxdigit((unsigned char)*s))
+								digest_out[k++] = (char)tolower((unsigned char)*s++);
+							digest_out[k] = '\0';
+						}
+						break;
+					}
+				}
+			}
+			return out;
+		}
+
+		pos = end + 1;
+	}
+
+	return NULL;
+}
+
+static void extract_first_paragraph(const char* body, char* out, size_t out_size) {
+	if (!body || !out || out_size == 0)
+		return;
+
+	out[0] = '\0';
+	size_t j = 0;
+
+	for (size_t i = 0; body[i] && j < out_size - 1; i++) {
+		if (body[i] == '\\' && body[i + 1] == 'r') {
+			i++;
+			continue;
+		}
+		if (body[i] == '\\' && body[i + 1] == 'n') {
+			// Check for paragraph break: \n followed by optional \r then \n
+			size_t k = i + 2;
+			if (body[k] == '\\' && body[k + 1] == 'r')
+				k += 2;
+			if (body[k] == '\\' && body[k + 1] == 'n')
+				break;
+			out[j++] = ' ';
+			i++;
+			continue;
+		}
+		if (body[i] == '#') {
+			while (body[i] == '#')
+				i++;
+			if (body[i] == ' ')
+				i++;
+			i--;
+			continue;
+		}
+		out[j++] = body[i];
+	}
+
+	out[j] = '\0';
+	while (j > 0 && (out[j - 1] == ' ' || out[j - 1] == '\n' || out[j - 1] == '\r'))
+		out[--j] = '\0';
+}
+
+// ============================================
+// Version reading
+// ============================================
+
+static void read_current_version(char* version, size_t ver_size,
+								 char* sha, size_t sha_size,
+								 char* tag, size_t tag_size) {
+	version[0] = '\0';
+	sha[0] = '\0';
+	tag[0] = '\0';
+
+	FILE* f = fopen(VERSION_FILE_PATH, "r");
+	if (!f) {
+		snprintf(version, ver_size, "未知");
+		return;
+	}
+
+	if (!fgets(version, ver_size, f)) {
+		snprintf(version, ver_size, "未知");
+		fclose(f);
+		return;
+	}
+	version[strcspn(version, "\r\n")] = '\0';
+
+	if (!fgets(sha, sha_size, f))
+		sha[0] = '\0';
+	sha[strcspn(sha, "\r\n")] = '\0';
+
+	if (!fgets(tag, tag_size, f))
+		tag[0] = '\0';
+	tag[strcspn(tag, "\r\n")] = '\0';
+
+	fclose(f);
+}
+
+// ============================================
+// Command execution (no shell, avoids injection)
+// ============================================
+
+static int run_command(char* const argv[]) {
+	pid_t pid = fork();
+	if (pid < 0)
+		return -1;
+
+	if (pid == 0) {
+		freopen("/dev/null", "w", stderr);
+		execvp(argv[0], argv);
+		_exit(127);
+	}
+
+	int status;
+	waitpid(pid, &status, 0);
+	if (WIFEXITED(status))
+		return WEXITSTATUS(status);
+	return -1;
+}
+
+// ============================================
+// Background auto-check thread
+// ============================================
+
+// Buffer size for GitHub API response (releases/latest JSON)
+#define API_RESPONSE_SIZE (64 * 1024)
+
+// Buffer size for the wget -S header dump of the releases/latest redirect
+#define HEADERS_BUF_SIZE 8192
+
+static void* auto_check_thread(void* arg) {
+	(void)arg;
+
+	char headers[HEADERS_BUF_SIZE];
+	char location[512];
+
+	if (wget_fetch_headers_noredirect(UPDATER_WEB_LATEST_URL,
+									  headers, sizeof(headers)) < 0 ||
+		updater_parse_location_header(headers, location, sizeof(location)) != 0 ||
+		updater_parse_tag_from_location(location, auto_tag, sizeof(auto_tag)) != 0) {
+		snprintf(auto_error, sizeof(auto_error), "检查更新失败");
+		auto_success = 0;
+		__sync_synchronize();
+		auto_done = 1;
+		return NULL;
+	}
+
+	auto_success = 1;
+	__sync_synchronize();
+	auto_done = 1;
+	return NULL;
+}
+
+// Compare the fetched tag and update state. Called from main thread.
+static void process_auto_check_result(void) {
+	pthread_join(auto_tid, NULL);
+
+	if (!auto_success) {
+		auto_state = UPDATE_ERROR;
+		snprintf(item_label, sizeof(item_label), "Updater");
+		snprintf(item_desc, sizeof(item_desc), "%s", auto_error);
+		return;
+	}
+
+	// Compare tag names
+	int is_same = 0;
+	if (current_tag_cache[0] && auto_tag[0]) {
+		if (strcmp(current_tag_cache, auto_tag) == 0)
+			is_same = 1;
+	}
+
+	if (is_same) {
+		auto_state = UPDATE_UP_TO_DATE;
+		snprintf(item_label, sizeof(item_label), "已是最新版本");
+		item_desc[0] = '\0';
+	} else {
+		// Only the tag is known from the redirect; download URL, release
+		// notes and sha256 are filled in at install time (fetch_release_details).
+		memset(&cached_release, 0, sizeof(cached_release));
+		snprintf(cached_release.tag_name, sizeof(cached_release.tag_name),
+				 "%s", auto_tag);
+		auto_state = UPDATE_AVAILABLE;
+		snprintf(item_label, sizeof(item_label), "安装更新");
+		snprintf(item_desc, sizeof(item_desc), "%s", cached_release.tag_name);
+	}
+}
+
+// ============================================
+// Extract context (for 7z thread)
+// ============================================
+
+typedef struct {
+	volatile int done;
+	volatile int success;
+	char error[256];
+} ExtractContext;
+
+static void* extract_thread(void* arg) {
+	ExtractContext* ctx = (ExtractContext*)arg;
+
+	char out_arg[256];
+	snprintf(out_arg, sizeof(out_arg), "-o%s", EXTRACT_DEST);
+	// The release zip also carries the card skeleton (Roms/Bios folders,
+	// Shaders presets, Overlays, sample art) that players edit or replace,
+	// so that part only adds what is missing (-aos). The system parts -
+	// MinUI.zip, the pakz, the stock-launcher shim and the shader sources -
+	// are always replaced (-aoa) in a second pass.
+	char* user_argv[] = {UPDATER_7Z, "x", DOWNLOAD_PATH, out_arg, "-aos",
+						 "-x!MinUI.zip", "-x!*.pakz", "-x!trimui", "-x!README.txt",
+						 "-x!Shaders/glsl", NULL};
+	char* system_argv[] = {UPDATER_7Z, "x", DOWNLOAD_PATH, out_arg, "-aoa",
+						   "MinUI.zip", "*.pakz", "trimui", "README.txt", "Shaders/glsl", NULL};
+
+	int ret = run_command(user_argv);
+	if (ret == 0)
+		ret = run_command(system_argv);
+	if (ret != 0) {
+		// Don't leave the zip in the card root: a retry downloads it again,
+		// and Windows Explorer prompts for a "multi-volume set" on a bad zip.
+		unlink(DOWNLOAD_PATH);
+		// nor a possibly truncated MinUI.zip for the next boot to install
+		unlink(EXTRACT_DEST "MinUI.zip");
+		snprintf(ctx->error, sizeof(ctx->error), "解压失败");
+		ctx->success = 0;
+		__sync_synchronize();
+		ctx->done = 1;
+		return NULL;
+	}
+
+	unlink(DOWNLOAD_PATH);
+
+	ctx->success = 1;
+	__sync_synchronize();
+	ctx->done = 1;
+	return NULL;
+}
+
+// ============================================
+// Download state (shared with download thread)
+// ============================================
+
+typedef struct {
+	char url[512];
+	char filepath[256];
+	volatile int progress;
+	volatile bool cancel;
+	volatile int speed;
+	volatile int eta;
+	volatile bool done;
+	int result;
+} DownloadContext;
+
+static DownloadContext dl_ctx;
+
+static void* download_thread_func(void* arg) {
+	(void)arg;
+	dl_ctx.result = wget_download_file(
+		dl_ctx.url, dl_ctx.filepath,
+		&dl_ctx.progress, &dl_ctx.cancel,
+		&dl_ctx.speed, &dl_ctx.eta);
+	dl_ctx.done = true;
+	return NULL;
+}
+
+// ============================================
+// Full-screen update page helpers
+// ============================================
+
+static void format_speed(int speed_bps, char* out, size_t out_size) {
+	if (speed_bps >= 1024 * 1024)
+		snprintf(out, out_size, "%.1f MB/s", speed_bps / (1024.0 * 1024.0));
+	else if (speed_bps >= 1024)
+		snprintf(out, out_size, "%.0f KB/s", speed_bps / 1024.0);
+	else if (speed_bps > 0)
+		snprintf(out, out_size, "%d B/s", speed_bps);
+	else
+		out[0] = '\0';
+}
+
+static void format_eta(int eta_sec, char* out, size_t out_size) {
+	if (eta_sec <= 0) {
+		out[0] = '\0';
+		return;
+	}
+	if (eta_sec >= 3600)
+		snprintf(out, out_size, "%d:%02d:%02d", eta_sec / 3600, (eta_sec % 3600) / 60, eta_sec % 60);
+	else if (eta_sec >= 60)
+		snprintf(out, out_size, "%d:%02d", eta_sec / 60, eta_sec % 60);
+	else
+		snprintf(out, out_size, "%d秒", eta_sec);
+}
+
+static void render_update_page(SDL_Surface* screen, const char* title,
+							   const char* status, int progress_pct,
+							   const char* speed_str, const char* eta_str,
+							   int show_cancel) {
+	GFX_clear(screen);
+	UI_renderMenuBar(screen, title);
+
+	// Build detail string from speed and ETA
+	char detail[128] = "";
+	if ((speed_str && speed_str[0]) || (eta_str && eta_str[0])) {
+		if (speed_str && speed_str[0] && eta_str && eta_str[0])
+			snprintf(detail, sizeof(detail), "%s - 剩余 %s", speed_str, eta_str);
+		else if (speed_str && speed_str[0])
+			snprintf(detail, sizeof(detail), "%s", speed_str);
+		else if (eta_str && eta_str[0])
+			snprintf(detail, sizeof(detail), "剩余 %s", eta_str);
+	}
+
+	UI_renderDownloadProgress(screen, &(UIDownloadProgress){
+										  .status = status,
+										  .detail = detail,
+										  .progress = progress_pct,
+										  .show_bar = (progress_pct >= 0),
+									  });
+
+	if (show_cancel)
+		UI_renderButtonHintBar(screen, (char*[]){"B", "取消", NULL});
+
+	GFX_flip(screen);
+}
+
+static void show_message_page(SDL_Surface* screen, const char* title, const char* message) {
+	unsigned long start = SDL_GetTicks();
+	while (SDL_GetTicks() - start < 2000) {
+		GFX_startFrame();
+		PAD_poll();
+		if (PAD_justPressed(BTN_A) || PAD_justPressed(BTN_B))
+			break;
+		render_update_page(screen, title, message, -1, NULL, NULL, 0);
+	}
+}
+
+// ============================================
+// On-demand release details (notes + asset URL + digest)
+// ============================================
+
+// Fetched from api.github.com only when the user actually installs — the
+// frequent automatic check never touches the rate-limited API. When this
+// fails (e.g. the 60 req/hour per-IP limit), the updater falls back to the
+// tag-derived asset URL with no release notes and no sha256 digest.
+
+enum { DETAILS_RUNNING = 0,
+	   DETAILS_DONE = 1,
+	   DETAILS_ABANDONED = 2 };
+
+typedef struct {
+	volatile int state; // DETAILS_* handoff: whoever loses the CAS cleans up
+	char* data;			// malloc'd JSON on success, else NULL
+} DetailsFetchContext;
+
+static void* details_fetch_thread(void* arg) {
+	DetailsFetchContext* ctx = (DetailsFetchContext*)arg;
+
+	char url[256];
+	snprintf(url, sizeof(url),
+			 "https://api.github.com/repos/%s/%s/releases/latest",
+			 UPDATER_REPO_OWNER, UPDATER_REPO_NAME);
+
+	uint8_t* buf = malloc(API_RESPONSE_SIZE);
+	if (buf) {
+		int ret = wget_fetch(url, buf, API_RESPONSE_SIZE);
+		if (ret > 0) {
+			buf[ret] = '\0';
+			ctx->data = (char*)buf;
+		} else {
+			free(buf);
+		}
+	}
+
+	if (!__sync_bool_compare_and_swap(&ctx->state, DETAILS_RUNNING, DETAILS_DONE)) {
+		// User cancelled while we were fetching; nobody will read this.
+		free(ctx->data);
+		free(ctx);
+	}
+	return NULL;
+}
+
+// Fill `release` (already carrying the tag from the redirect check) with the
+// download URL, notes and digest. Returns 1 to proceed, 0 if the user
+// cancelled, -1 if no download URL could be determined.
+static int fetch_release_details(SDL_Surface* screen, ReleaseInfo* release) {
+	DetailsFetchContext* ctx = calloc(1, sizeof(*ctx));
+	char* data = NULL;
+
+	if (ctx) {
+		pthread_t tid;
+		if (pthread_create(&tid, NULL, details_fetch_thread, ctx) != 0) {
+			free(ctx);
+			ctx = NULL; // fall through to the tag-derived URL
+		} else {
+			pthread_detach(tid);
+		}
+	}
+
+	while (ctx) {
+		GFX_startFrame();
+		PAD_poll();
+
+		if (PAD_justPressed(BTN_B)) {
+			if (!__sync_bool_compare_and_swap(&ctx->state, DETAILS_RUNNING,
+											  DETAILS_ABANDONED)) {
+				// Thread finished between frames; the context is ours.
+				__sync_synchronize();
+				free(ctx->data);
+				free(ctx);
+			}
+			return 0;
+		}
+
+		if (ctx->state == DETAILS_DONE) {
+			__sync_synchronize();
+			data = ctx->data;
+			free(ctx);
+			ctx = NULL;
+			break;
+		}
+
+		render_update_page(screen, "有可用更新",
+						   "正在获取版本信息...", -1, NULL, NULL, 1);
+	}
+
+	if (data) {
+		// Full release info from the API: exact asset URL, notes, sha256.
+		ReleaseInfo api = {0};
+		if (json_extract_string(data, "tag_name", api.tag_name,
+								sizeof(api.tag_name)) &&
+			find_zip_asset_url(data, get_asset_suffix(), api.download_url,
+							   sizeof(api.download_url),
+							   api.expected_sha256, sizeof(api.expected_sha256))) {
+			char body[4096] = "";
+			json_extract_string(data, "body", body, sizeof(body));
+			extract_first_paragraph(body, api.release_notes,
+									sizeof(api.release_notes));
+			*release = api;
+			free(data);
+			return 1;
+		}
+		free(data);
+	}
+
+	// API unavailable (rate limited) or unparsable: derive the asset URL
+	// from the tag. Assets are named NXRedux-<tag>-<suffix> from the
+	// first release that ships this updater.
+	release->release_notes[0] = '\0';
+	release->expected_sha256[0] = '\0';
+	if (updater_build_fallback_url(UPDATER_REPO_OWNER, UPDATER_REPO_NAME,
+								   release->tag_name, get_device_name(),
+								   release->download_url,
+								   sizeof(release->download_url)) != 0)
+		return -1;
+	return 1;
+}
+
+// Show update info (version + release notes) with A to confirm, B to cancel.
+static int show_update_info(SDL_Surface* screen, ReleaseInfo* release) {
+	while (1) {
+		GFX_startFrame();
+		PAD_poll();
+
+		if (PAD_justPressed(BTN_B))
+			return 0;
+		if (PAD_justPressed(BTN_A))
+			return 1;
+
+		GFX_clear(screen);
+		UI_renderMenuBar(screen, "有可用更新");
+		UI_renderButtonHintBar(screen, (char*[]){"B", "取消", "A", "安装", NULL});
+
+		int bar_h = BAR_HEIGHT;
+		int y = bar_h + SCALE1(PADDING * 2);
+
+		SDL_Surface* tag_surf = GFX_renderText(font.large, release->tag_name, COLOR_WHITE);
+		if (tag_surf) {
+			SDL_BlitSurface(tag_surf, NULL, screen,
+							&(SDL_Rect){(screen->w - tag_surf->w) / 2, y});
+			y += tag_surf->h + SCALE1(PADDING);
+			SDL_FreeSurface(tag_surf);
+		}
+
+		{
+			int max_w = screen->w - SCALE1(PADDING * 4);
+			char notes_copy[2048];
+			strncpy(notes_copy,
+					release->release_notes[0]
+						? release->release_notes
+						: "暂时无法获取更新说明，但您 "
+						  "仍可更新到最新版本。按 A 安装。",
+					sizeof(notes_copy) - 1);
+			notes_copy[sizeof(notes_copy) - 1] = '\0';
+
+			int max_lines = 8;
+			GFX_wrapText(font.small, notes_copy, max_w, max_lines);
+			GFX_blitWrappedText(font.small, notes_copy, max_w, max_lines,
+								COLOR_GRAY, screen, y);
+		}
+
+		GFX_flip(screen);
+	}
+}
+
+// Compute the SHA-256 of a file as a lowercase hex string, using the device's
+// sha256sum (busybox). `path` is a compile-time constant (DOWNLOAD_PATH), so
+// there is no shell-injection surface. Returns 0 on success, -1 otherwise.
+static int sha256_file_hex(const char* path, char out_hex[65]) {
+	char cmd[300];
+	snprintf(cmd, sizeof(cmd), "sha256sum '%s' 2>/dev/null", path);
+	FILE* p = popen(cmd, "r");
+	if (!p)
+		return -1;
+	char line[160] = {0};
+	char* got = fgets(line, sizeof(line), p);
+	pclose(p);
+	if (!got)
+		return -1;
+	// Output is "<64 hex chars>  <path>"; take and lowercase the first 64.
+	for (int i = 0; i < 64; i++) {
+		char c = line[i];
+		if (!isxdigit((unsigned char)c))
+			return -1;
+		out_hex[i] = (char)tolower((unsigned char)c);
+	}
+	out_hex[64] = '\0';
+	return 0;
+}
+
+// Confirm the downloaded package matches the SHA-256 advertised in the release
+// JSON (GitHub's asset "digest"). This guards against a corrupted/truncated
+// download being extracted over the system partition. It is an integrity check,
+// not authentication — a network attacker who can rewrite the download can also
+// rewrite the digest (see the audit notes for why signing would be needed for
+// that). Returns 1 = matched, 0 = no digest advertised (skip), -1 = MISMATCH.
+static int verify_update_hash(const char* zip_path, const char* expected_sha256) {
+	if (!expected_sha256 || expected_sha256[0] == '\0') {
+		LOG_warn("[Updater] release has no sha256 digest; skipping hash check\n");
+		return 0;
+	}
+	char actual[65];
+	if (sha256_file_hex(zip_path, actual) != 0) {
+		LOG_warn("[Updater] could not compute sha256 (sha256sum missing?); skipping\n");
+		return 0; // don't block updates if the tool is unavailable
+	}
+	if (strcasecmp(actual, expected_sha256) != 0) {
+		LOG_error("[Updater] sha256 mismatch: expected %s got %s\n", expected_sha256, actual);
+		return -1;
+	}
+	LOG_info("[Updater] update sha256 verified\n");
+	return 1;
+}
+
+// Run download + extract + reboot with full-screen progress pages.
+static void do_install(SDL_Surface* screen, ReleaseInfo* release) {
+	pthread_t tid;
+
+	// Running out of space mid-install leaves a half-unpacked update, so
+	// refuse up front (a stale partial download is not counted against it)
+	unlink(DOWNLOAD_PATH);
+	struct statvfs vfs;
+	if (statvfs(EXTRACT_DEST, &vfs) == 0) {
+		unsigned long long free_mb = (unsigned long long)vfs.f_bavail * vfs.f_frsize / (1024 * 1024);
+		if (free_mb < UPDATE_MIN_FREE_MB) {
+			char msg[128];
+			snprintf(msg, sizeof(msg), "请释放 SD 卡 %llu MB 空间",
+					 UPDATE_MIN_FREE_MB - free_mb);
+			show_message_page(screen, "存储空间不足", msg);
+			return;
+		}
+	}
+
+	// Prevent screen off and disable WiFi power save during update
+	PWR_disableAutosleep();
+	PWR_disableSleep();
+	system("iw dev wlan0 set power_save off 2>/dev/null");
+
+	// --- Download phase ---
+	unlink(DOWNLOAD_PATH);
+
+	// Start download in background thread via wget_download_file
+	memset(&dl_ctx, 0, sizeof(dl_ctx));
+	snprintf(dl_ctx.url, sizeof(dl_ctx.url), "%s", release->download_url);
+	snprintf(dl_ctx.filepath, sizeof(dl_ctx.filepath), "%s", DOWNLOAD_PATH);
+
+	if (pthread_create(&tid, NULL, download_thread_func, NULL) != 0) {
+		PWR_enableSleep();
+		PWR_enableAutosleep();
+		system("iw dev wlan0 set power_save on 2>/dev/null");
+		show_message_page(screen, "更新出错", "无法开始下载");
+		return;
+	}
+
+	int cancelled = 0;
+	int dl_success = 0;
+
+	while (!dl_ctx.done) {
+		GFX_startFrame();
+		PAD_poll();
+
+		// Cancel
+		if (PAD_justPressed(BTN_B)) {
+			dl_ctx.cancel = true;
+			pthread_join(tid, NULL);
+			unlink(DOWNLOAD_PATH);
+			cancelled = 1;
+			break;
+		}
+
+		// Read progress from download thread
+		int progress_pct = dl_ctx.progress;
+		int speed_bps = dl_ctx.speed;
+		int eta_sec = dl_ctx.eta;
+
+		char dl_status[256];
+		if (progress_pct > 0)
+			snprintf(dl_status, sizeof(dl_status), "%s (%d%%)", release->tag_name, progress_pct);
+		else
+			snprintf(dl_status, sizeof(dl_status), "%s - 连接中...", release->tag_name);
+
+		char speed_str[32] = "";
+		char eta_str[32] = "";
+		format_speed(speed_bps, speed_str, sizeof(speed_str));
+		format_eta(eta_sec, eta_str, sizeof(eta_str));
+
+		render_update_page(screen, "正在下载更新",
+						   dl_status, progress_pct, speed_str, eta_str, 1);
+	}
+
+	if (!cancelled) {
+		pthread_join(tid, NULL);
+		dl_success = (dl_ctx.result > 0);
+	}
+
+	// Re-enable WiFi power save after download (keep sleep disabled through extract)
+	system("iw dev wlan0 set power_save on 2>/dev/null");
+
+	if (cancelled) {
+		PWR_enableSleep();
+		PWR_enableAutosleep();
+		return;
+	}
+
+	if (!dl_success) {
+		// wget_download_file keeps partial files for resume, but the updater
+		// never resumes (it unlinks before each download). A truncated zip
+		// left in the card root makes Windows Explorer prompt for "the last
+		// disk of the multi-volume set" whenever the card is plugged in.
+		unlink(DOWNLOAD_PATH);
+		PWR_enableSleep();
+		PWR_enableAutosleep();
+		show_message_page(screen, "更新出错", "下载失败");
+		return;
+	}
+
+	// --- Verify integrity before extracting over the system partition ---
+	{
+		render_update_page(screen, "正在验证更新", "正在检查下载...", -1, NULL, NULL, 0);
+		int vr = verify_update_hash(DOWNLOAD_PATH, release->expected_sha256);
+		if (vr < 0) { // -1 = mismatch (corrupted download); 0 = nothing to check
+			unlink(DOWNLOAD_PATH);
+			PWR_enableSleep();
+			PWR_enableAutosleep();
+			show_message_page(screen, "更新出错", "下载已损坏");
+			return;
+		}
+	}
+
+	// --- Extract phase ---
+	ExtractContext ex = {0};
+
+	if (pthread_create(&tid, NULL, extract_thread, &ex) != 0) {
+		PWR_enableSleep();
+		PWR_enableAutosleep();
+		show_message_page(screen, "更新出错", "无法开始安装");
+		return;
+	}
+
+	// Render installing page until done
+	while (!ex.done) {
+		GFX_startFrame();
+		PAD_poll();
+		render_update_page(screen, "正在安装更新",
+						   "请勿关机...", -1, NULL, NULL, 0);
+	}
+	__sync_synchronize();
+	pthread_join(tid, NULL);
+
+	if (!ex.success) {
+		PWR_enableSleep();
+		PWR_enableAutosleep();
+		show_message_page(screen, "更新出错", ex.error);
+		return;
+	}
+
+	// --- Reboot ---
+	PWR_enableSleep();
+	PWR_enableAutosleep();
+	render_update_page(screen, "更新完成",
+					   "正在重启...", -1, NULL, NULL, 0);
+	sleep(2);
+	system("reboot");
+}
+
+// ============================================
+// Find the updater item in the page
+// ============================================
+
+static SettingItem* find_updater_item(SettingsPage* page) {
+	for (int i = 0; i < page->item_count; i++) {
+		if (page->items[i].on_press == updater_check_for_updates)
+			return &page->items[i];
+	}
+	return NULL;
+}
+
+// ============================================
+// Public API
+// ============================================
+
+void updater_about_on_show(SettingsPage* page) {
+	(void)page;
+
+	char version[128];
+	char sha[64];
+	read_current_version(version, sizeof(version),
+						 sha, sizeof(sha),
+						 current_tag_cache, sizeof(current_tag_cache));
+
+	// Only auto-check once per session (retry allowed on error)
+	if (auto_state == UPDATE_CHECKING || auto_state == UPDATE_UP_TO_DATE ||
+		auto_state == UPDATE_AVAILABLE)
+		return;
+
+	// Check WiFi before attempting update check
+	if (!Wifi_isConnected()) {
+		auto_state = UPDATE_ERROR;
+		snprintf(item_label, sizeof(item_label), "Updater");
+		snprintf(item_desc, sizeof(item_desc), "无网络连接");
+		SettingItem* item = find_updater_item(page);
+		if (item) {
+			item->name = item_label;
+			item->desc = item_desc;
+		}
+		return;
+	}
+
+	auto_done = 0;
+	auto_success = 0;
+	auto_tag[0] = '\0';
+	auto_error[0] = '\0';
+	auto_state = UPDATE_CHECKING;
+	snprintf(item_label, sizeof(item_label), "正在检查更新..");
+	item_desc[0] = '\0';
+
+	SettingItem* item = find_updater_item(page);
+	if (item) {
+		item->name = item_label;
+		item->desc = item_desc;
+		item->type = ITEM_STATIC;
+	}
+
+	if (pthread_create(&auto_tid, NULL, auto_check_thread, NULL) != 0) {
+		auto_state = UPDATE_ERROR;
+		snprintf(item_label, sizeof(item_label), "Updater");
+		snprintf(item_desc, sizeof(item_desc), "无法开始检查更新");
+		if (item) {
+			item->name = item_label;
+			item->desc = item_desc;
+			item->type = ITEM_BUTTON;
+		}
+	}
+}
+
+void updater_about_on_tick(SettingsPage* page) {
+	if (auto_state != UPDATE_CHECKING || !auto_done)
+		return;
+
+	__sync_synchronize();
+	process_auto_check_result();
+
+	SettingItem* item = find_updater_item(page);
+	if (item) {
+		item->name = item_label;
+		item->desc = item_desc;
+		// Only make clickable if there's an update or error (retry)
+		item->type = (auto_state == UPDATE_AVAILABLE || auto_state == UPDATE_ERROR)
+						 ? ITEM_BUTTON
+						 : ITEM_STATIC;
+		page->needs_layout = 1;
+	}
+}
+
+void updater_check_for_updates(void) {
+	// Item is ITEM_STATIC during checking, so this shouldn't be called,
+	// but guard anyway
+	if (auto_state == UPDATE_CHECKING)
+		return;
+
+	// Do nothing if already up to date
+	if (auto_state == UPDATE_UP_TO_DATE)
+		return;
+
+	// If update available, show info and install
+	if (auto_state == UPDATE_AVAILABLE) {
+		SettingsPage* page = settings_menu_current();
+		if (!page || !page->screen)
+			return;
+
+		SDL_Surface* screen = page->screen;
+
+		int dr = fetch_release_details(screen, &cached_release);
+		if (dr < 0) {
+			show_message_page(screen, "更新出错", "无法确定下载地址");
+			return;
+		}
+		if (dr == 0)
+			return;
+
+		if (!show_update_info(screen, &cached_release))
+			return;
+
+		do_install(screen, &cached_release);
+		return;
+	}
+
+	// Error or idle: retry the check (non-blocking, will update via on_tick)
+	auto_state = UPDATE_IDLE;
+	SettingsPage* page = settings_menu_current();
+	if (page)
+		updater_about_on_show(page);
+
+	SettingItem* item = find_updater_item(page);
+	if (item) {
+		item->name = item_label;
+		item->desc = item_desc;
+	}
+}
