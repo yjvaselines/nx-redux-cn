@@ -82,7 +82,7 @@ docker run --rm -v $(pwd)/workspace:/root/workspace -w /root/workspace \
 
 ## Release
 
-Releases 页提供**完整刷入包**（`2.1.2.zip`，适配 Trimui Brick Pro / tg5040）：真机完整镜像（`.system` / `.tmp_update` / `.userdata` / `Bios` / `Overlays`），解压到 SD 卡根目录覆盖即可。
+Releases 页提供**官方结构刷入包**（`NXRedux-2.1.2-cn-brickpro.zip`，Trimui Brick Pro / tg5040）：解压到 exFAT 格式的 **SD 卡根目录**即可。包内为基础文件（Bios / Roms / Overlays / Cheats 等）与 `MinUI.zip`（内含 `.system`、`.tmp_update`、`Emus`、`Tools`，设备启动时自动安装/更新）。
 
 刷入包已**预置**以下配置，解压后自动就位，无需手动操作：
 
