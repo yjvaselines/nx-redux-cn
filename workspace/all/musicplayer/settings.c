@@ -17,12 +17,6 @@
 #endif
 #define SETTINGS_FILE SETTINGS_DIR "/settings.cfg"
 
-// Valid screen off timeout values (in seconds)
-// 0 means off (no auto screen off)
-static const int screen_off_values[] = {60, 90, 120, 0};
-#define SCREEN_OFF_VALUE_COUNT 4
-#define DEFAULT_SCREEN_OFF_INDEX 0 // Default to 60s
-
 // Bass filter (high-pass cutoff Hz, 0 = off)
 static const int bass_filter_values[] = {0, 80, 100, 120, 150, 200};
 #define BASS_FILTER_VALUE_COUNT 6
@@ -45,7 +39,6 @@ static const int buffer_frames_values[] = {1024, 2048, 4096};
 static bool settings_owner_mode;
 
 static struct {
-	int screen_off_timeout; // seconds, 0 = off
 	bool lyrics_enabled;	// true = show lyrics
 	int bass_filter_hz;		// 0=off, 80, 100, 120, 150, 200
 	int soft_limiter_index; // 0=off, 1=mild, 2=medium, 3=strong
@@ -53,16 +46,6 @@ static struct {
 	int resampler_quality;	// 0=Fast, 1=Medium, 2=Best
 	int buffer_frames;		// 1024, 2048, 4096
 } current_settings;
-
-// Find index of current screen off value in the values array
-static int get_screen_off_index(void) {
-	for (int i = 0; i < SCREEN_OFF_VALUE_COUNT; i++) {
-		if (screen_off_values[i] == current_settings.screen_off_timeout) {
-			return i;
-		}
-	}
-	return DEFAULT_SCREEN_OFF_INDEX;
-}
 
 // Find index of current bass filter value
 static int get_bass_filter_index(void) {
@@ -109,7 +92,6 @@ void Settings_setAudioValues(int bass_filter_hz, float soft_limiter_threshold,
 
 void Settings_init(void) {
 	// Set defaults
-	current_settings.screen_off_timeout = screen_off_values[DEFAULT_SCREEN_OFF_INDEX];
 	current_settings.lyrics_enabled = true;
 	current_settings.bass_filter_hz = bass_filter_values[DEFAULT_BASS_FILTER_INDEX];
 	current_settings.soft_limiter_index = DEFAULT_SOFT_LIMITER_INDEX;
@@ -125,15 +107,6 @@ void Settings_init(void) {
 	char line[256];
 	while (fgets(line, sizeof(line), f)) {
 		int value;
-		if (sscanf(line, "screen_off_timeout=%d", &value) == 1) {
-			// Validate the value
-			for (int i = 0; i < SCREEN_OFF_VALUE_COUNT; i++) {
-				if (screen_off_values[i] == value) {
-					current_settings.screen_off_timeout = value;
-					break;
-				}
-			}
-		}
 		if (sscanf(line, "lyrics_enabled=%d", &value) == 1) {
 			current_settings.lyrics_enabled = (value != 0);
 		}
@@ -175,43 +148,8 @@ void Settings_quit(void) {
 }
 
 int Settings_getScreenOffTimeout(void) {
-	// 取 app 设置与系统全局设置的较小值：系统设了更短的熄屏超时（省电意图）时遵守系统
-	int app_timeout = current_settings.screen_off_timeout;
-	if (app_timeout == 0)
-		return 0; // app 内明确关闭自动熄屏
-	int global_timeout = (int)CFG_getScreenTimeoutSecs();
-	if (global_timeout > 0 && global_timeout < app_timeout)
-		return global_timeout;
-	return app_timeout;
-}
-
-void Settings_cycleScreenOffNext(void) {
-	int index = get_screen_off_index();
-	index = (index + 1) % SCREEN_OFF_VALUE_COUNT;
-	current_settings.screen_off_timeout = screen_off_values[index];
-	Settings_save();
-}
-
-void Settings_cycleScreenOffPrev(void) {
-	int index = get_screen_off_index();
-	index = (index - 1 + SCREEN_OFF_VALUE_COUNT) % SCREEN_OFF_VALUE_COUNT;
-	current_settings.screen_off_timeout = screen_off_values[index];
-	Settings_save();
-}
-
-const char* Settings_getScreenOffDisplayStr(void) {
-	switch (current_settings.screen_off_timeout) {
-	case 60:
-		return "60s";
-	case 90:
-		return "90s";
-	case 120:
-		return "120s";
-	case 0:
-		return "Off";
-	default:
-		return "60s";
-	}
+	// 与系统熄屏时间保持一致（Settings.pak 中的屏幕超时设置）
+	return (int)CFG_getScreenTimeoutSecs();
 }
 
 void Settings_save(void) {
@@ -234,7 +172,7 @@ void Settings_save(void) {
 	if (old) {
 		while (preserved_count < 5 && fgets(line, sizeof(line), old)) {
 			bool other_owner = settings_owner_mode
-								   ? strncmp(line, "screen_off_timeout=", 19) == 0 || strncmp(line, "lyrics_enabled=", 15) == 0
+								   ? strncmp(line, "lyrics_enabled=", 15) == 0
 								   : strncmp(line, "bass_filter_hz=", 15) == 0 || strncmp(line, "soft_limiter=", 13) == 0 ||
 										 strncmp(line, "sample_rate_follow=", 19) == 0 || strncmp(line, "resampler_quality=", 18) == 0 ||
 										 strncmp(line, "buffer_frames=", 14) == 0;
@@ -258,7 +196,6 @@ void Settings_save(void) {
 			fprintf(file, "resampler_quality=%d\n", current_settings.resampler_quality);
 			fprintf(file, "buffer_frames=%d\n", current_settings.buffer_frames);
 		} else {
-			fprintf(file, "screen_off_timeout=%d\n", current_settings.screen_off_timeout);
 			fprintf(file, "lyrics_enabled=%d\n", current_settings.lyrics_enabled ? 1 : 0);
 			for (int i = 0; i < preserved_count; i++)
 				fputs(preserved[i], file);

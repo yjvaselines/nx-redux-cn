@@ -20,11 +20,6 @@
 static bool autosleep_disabled = false;
 static uint32_t last_input_time = 0;
 
-// Screen off hint state
-static bool screen_off_hint_active = false;
-static uint32_t screen_off_hint_start = 0;
-static time_t screen_off_hint_start_wallclock = 0;
-
 // Dialog states
 static bool show_controls_help = false;
 
@@ -69,8 +64,7 @@ void ModuleCommon_tickToast(char* message, uint32_t toast_time, bool* dirty) {
 void ModuleCommon_init(void) {
 	autosleep_disabled = false;
 	last_input_time = SDL_GetTicks();
-	screen_off_hint_active = false;
-	show_controls_help = false;
+        show_controls_help = false;
 	overlay_buttons_were_active = false;
 	overlay_release_time = 0;
 }
@@ -222,18 +216,20 @@ void ModuleCommon_setAutosleepDisabled(bool disabled) {
 	}
 }
 
-bool ModuleCommon_isScreenOffHintActive(void) {
-	return screen_off_hint_active;
+// Module-wide dark-screen state: backlight off, playback keeps running.
+static bool module_screen_off = false;
+
+bool ModuleCommon_isScreenOff(void) {
+	return module_screen_off;
 }
 
-void ModuleCommon_startScreenOffHint(void) {
-	screen_off_hint_active = true;
-	screen_off_hint_start = SDL_GetTicks();
-	screen_off_hint_start_wallclock = time(NULL);
-}
-
-void ModuleCommon_resetScreenOffHint(void) {
-	screen_off_hint_active = false;
+void ModuleCommon_setScreenOff(bool off) {
+	if (module_screen_off == off)
+		return;
+	module_screen_off = off;
+	PLAT_enableBacklight(off ? 0 : 1);
+	if (!off)
+		ModuleCommon_recordInputTime();
 }
 
 void ModuleCommon_recordInputTime(void) {
@@ -241,62 +237,42 @@ void ModuleCommon_recordInputTime(void) {
 }
 
 bool ModuleCommon_checkAutoScreenOffTimeout(void) {
-	if (screen_off_hint_active)
+	if (module_screen_off)
 		return false;
 	uint32_t screen_timeout_ms = Settings_getScreenOffTimeout() * 1000;
 	if (screen_timeout_ms > 0 && SDL_GetTicks() - last_input_time >= screen_timeout_ms) {
-		ModuleCommon_startScreenOffHint();
+		ModuleCommon_setScreenOff(true); // 直接熄屏，无提示页
 		return true;
 	}
 	return false;
 }
 
-bool ModuleCommon_processScreenOffHintTimeout(void) {
-	if (!screen_off_hint_active)
-		return false;
-	uint32_t now = SDL_GetTicks();
-	time_t now_wallclock = time(NULL);
-	bool timeout_sdl = (now - screen_off_hint_start >= SCREEN_OFF_HINT_DURATION_MS);
-	bool timeout_wallclock = (now_wallclock - screen_off_hint_start_wallclock >= (SCREEN_OFF_HINT_DURATION_MS / 1000));
-	if (timeout_sdl || timeout_wallclock) {
-		screen_off_hint_active = false;
-		PLAT_enableBacklight(0);
-		return true;
-	}
-	return false;
-}
-
-DarkScreenAction ModuleCommon_handleDarkScreenInput(SDL_Surface* screen, bool* screen_off) {
+DarkScreenAction ModuleCommon_handleDarkScreenInput(void) {
 	// Mirrors PWR_update's power button handling, which the module skips while
-	// the screen is dark (its tap would deep-sleep instead of showing the hint).
+	// the screen is dark (its tap would deep-sleep instead of waking up).
 	static uint32_t power_pressed_at = 0;
 	uint32_t now = SDL_GetTicks();
 
 	if (PAD_justPressed(BTN_POWER))
 		power_pressed_at = now;
+
 	if (PAD_justReleased(BTN_POWEROFF) || (power_pressed_at && now - power_pressed_at >= 1000)) {
 		system("gametimectl.elf stop_all");
 		PWR_powerOff(0);
 	}
 	if (PAD_justReleased(BTN_POWER) && power_pressed_at) {
 		power_pressed_at = 0;
-		if (*screen_off) {
-			// 直接点亮屏幕恢复页面（不再走"提示→再次熄屏"）
-			*screen_off = false;
-			PLAT_enableBacklight(1);
-			ModuleCommon_recordInputTime();
+		if (module_screen_off) {
+			// 直接点亮屏幕恢复熄屏时的页面
+			ModuleCommon_setScreenOff(false);
 			return DARK_SCREEN_WAKE;
 		}
-		ModuleCommon_startScreenOffHint();
 		return DARK_SCREEN_NONE;
 	}
 
 	if (PAD_isPressed(BTN_SELECT) && PAD_isPressed(BTN_A)) {
 		power_pressed_at = 0;
-		*screen_off = false;
-		screen_off_hint_active = false;
-		PLAT_enableBacklight(1);
-		ModuleCommon_recordInputTime();
+		ModuleCommon_setScreenOff(false);
 		return DARK_SCREEN_WAKE;
 	}
 	if (PAD_justPressed(BTN_A))
@@ -340,8 +316,8 @@ void ModuleCommon_PWR_update(bool* dirty, IndicatorType* show_setting) {
 
 	// While playback disables sleep (setAutosleepDisabled above), PWR_update
 	// no longer consumes the power button (can_sleep==0): turn its short press
-	// into the screen-off hint, whose expiry kills only the backlight and the
-	// audio keeps playing. A >=1s hold still powers off inside PWR_update.
+	// into a direct screen-off (backlight only, audio keeps playing). A >=1s
+	// hold still powers off inside PWR_update.
 	static uint32_t screen_power_press_at = 0;
 	if (PAD_justPressed(BTN_POWER))
 		screen_power_press_at = SDL_GetTicks();
@@ -349,7 +325,7 @@ void ModuleCommon_PWR_update(bool* dirty, IndicatorType* show_setting) {
 		bool short_press = SDL_GetTicks() - screen_power_press_at < 1000;
 		screen_power_press_at = 0;
 		if (short_press) {
-			ModuleCommon_startScreenOffHint();
+			ModuleCommon_setScreenOff(true);
 			*dirty = 1;
 		}
 	}

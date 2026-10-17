@@ -20,16 +20,15 @@ typedef enum {
 } SettingsState;
 
 // Settings menu items
-#define SETTINGS_ITEM_SCREEN_OFF 0
-#define SETTINGS_ITEM_BALANCE 1
-#define SETTINGS_ITEM_BASS_FILTER 2
-#define SETTINGS_ITEM_SOFT_LIMITER 3
-#define SETTINGS_ITEM_SAMPLE_RATE 4
-#define SETTINGS_ITEM_RESAMPLER 5
-#define SETTINGS_ITEM_BUFFER 6
-#define SETTINGS_ITEM_CLEAR_CACHE 7
-#define SETTINGS_ITEM_CLEAR_LYRICS 8
-#define SETTINGS_ITEM_COUNT 9
+#define SETTINGS_ITEM_BALANCE 0
+#define SETTINGS_ITEM_BASS_FILTER 1
+#define SETTINGS_ITEM_SOFT_LIMITER 2
+#define SETTINGS_ITEM_SAMPLE_RATE 3
+#define SETTINGS_ITEM_RESAMPLER 4
+#define SETTINGS_ITEM_BUFFER 5
+#define SETTINGS_ITEM_CLEAR_CACHE 6
+#define SETTINGS_ITEM_CLEAR_LYRICS 7
+#define SETTINGS_ITEM_COUNT 8
 
 // Internal app state constants for controls help
 // These match the pattern used in ui_main.c
@@ -78,10 +77,7 @@ ModuleExitReason SettingsModule_run(SDL_Surface* screen) {
 				dirty = 1;
 			// Left/Right for cyclable settings
 			else if (PAD_justPressed(BTN_LEFT)) {
-				if (menu_selected == SETTINGS_ITEM_SCREEN_OFF) {
-					Settings_cycleScreenOffPrev();
-					dirty = 1;
-				} else if (menu_selected == SETTINGS_ITEM_BALANCE) {
+				if (menu_selected == SETTINGS_ITEM_BALANCE) {
 					int value = MusicBalance_getValue();
 					if (value > 0) {
 						int status = MusicBalance_setValue(value - 1);
@@ -110,10 +106,7 @@ ModuleExitReason SettingsModule_run(SDL_Surface* screen) {
 					dirty = 1;
 				}
 			} else if (PAD_justPressed(BTN_RIGHT)) {
-				if (menu_selected == SETTINGS_ITEM_SCREEN_OFF) {
-					Settings_cycleScreenOffNext();
-					dirty = 1;
-				} else if (menu_selected == SETTINGS_ITEM_BALANCE) {
+				if (menu_selected == SETTINGS_ITEM_BALANCE) {
 					int value = MusicBalance_getValue();
 					if (value < 10) {
 						int status = MusicBalance_setValue(value + 1);
@@ -143,11 +136,6 @@ ModuleExitReason SettingsModule_run(SDL_Surface* screen) {
 				}
 			} else if (PAD_justPressed(BTN_A)) {
 				switch (menu_selected) {
-				case SETTINGS_ITEM_SCREEN_OFF:
-					// A also cycles the value (convenience)
-					Settings_cycleScreenOffNext();
-					dirty = 1;
-					break;
 				case SETTINGS_ITEM_BASS_FILTER:
 					Settings_cycleBassFilterNext();
 					dirty = 1;

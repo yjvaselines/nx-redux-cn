@@ -171,20 +171,3 @@ void render_controls_help(SDL_Surface* screen, int app_state) {
 
 	UI_renderControlsHelp(screen, page_title, controls);
 }
-
-// Render screen off hint message (shown before screen turns off)
-void render_screen_off_hint(SDL_Surface* screen) {
-	int hw = screen->w;
-	int hh = screen->h;
-
-	// Fill entire screen with black
-	SDL_FillRect(screen, NULL, RGB_BLACK);
-
-	// Render hint message centered
-	const char* msg = "按 SELECT + A 唤醒屏幕";
-	SDL_Surface* msg_surf = GFX_renderText(font.medium, msg, COLOR_WHITE);
-	if (msg_surf) {
-		SDL_BlitSurface(msg_surf, NULL, screen, &(SDL_Rect){(hw - msg_surf->w) / 2, (hh - msg_surf->h) / 2});
-		SDL_FreeSurface(msg_surf);
-	}
-}

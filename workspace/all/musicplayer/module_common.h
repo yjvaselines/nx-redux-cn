@@ -6,9 +6,6 @@
 #include "api.h"
 #include "ui_contextmenu.h"
 
-// Screen off hint duration (time hint is shown before screen turns off)
-#define SCREEN_OFF_HINT_DURATION_MS 4000
-
 // Module exit reasons
 typedef enum {
 	MODULE_EXIT_TO_MENU, // User pressed B, return to main menu
@@ -56,39 +53,31 @@ void ModuleCommon_ctxAdd_impl(ContextMenuItem* items, int* count, int cap, const
 // Disable/enable autosleep (for modules with active playback)
 void ModuleCommon_setAutosleepDisabled(bool disabled);
 
-// Check if screen off hint is active
-bool ModuleCommon_isScreenOffHintActive(void);
+// Query the module-wide dark-screen state (backlight off, playback continues)
+bool ModuleCommon_isScreenOff(void);
 
-// Start screen off hint countdown
-void ModuleCommon_startScreenOffHint(void);
-
-// Reset (cancel) screen off hint
-void ModuleCommon_resetScreenOffHint(void);
-
-// Check screen off hint timeout using dual SDL tick + wallclock check.
-// If timed out: deactivates hint and disables backlight. Returns true.
-// If still counting down or hint not active: returns false.
-bool ModuleCommon_processScreenOffHintTimeout(void);
+// Turn the screen off (backlight only; audio keeps playing) or back on. When
+// turning back on the last-input time is refreshed so auto screen-off restarts.
+void ModuleCommon_setScreenOff(bool off);
 
 // What a module must do after ModuleCommon_handleDarkScreenInput.
 typedef enum {
 	DARK_SCREEN_NONE,	// nothing (or the helper already handled it)
-	DARK_SCREEN_WAKE,	// SELECT + A: the screen is back on, redraw the page
+	DARK_SCREEN_WAKE,	// screen back on: redraw the page
 	DARK_SCREEN_TOGGLE, // A: toggle play/pause the way the page's A does
 } DarkScreenAction;
 
-// Input while the screen-off hint is showing or the screen is dark. The module
-// skips global input and PWR_update then, so this owns the power button: a tap
-// brings the hint back (backlight on, screen_off cleared), a 1 s hold or the
-// platform power-off event powers the device off.
-DarkScreenAction ModuleCommon_handleDarkScreenInput(SDL_Surface* screen, bool* screen_off);
+// Input while the screen is dark. The module skips global input and PWR_update
+// then, so this owns the power button: a short tap lights the screen back up
+// and returns DARK_SCREEN_WAKE, A toggles playback, a 1 s hold or the platform
+// power-off event powers the device off. SELECT+A wakes too (legacy shortcut).
+DarkScreenAction ModuleCommon_handleDarkScreenInput(void);
 
 // Record last input time (for auto screen-off timeout)
 void ModuleCommon_recordInputTime(void);
 
 // Check if auto screen-off timeout has elapsed since last input.
-// If timed out: starts screen off hint and returns true.
-// Caller is responsible for clearing GPU layers after this returns true.
+// If timed out: turns the screen off directly (no hint page) and returns true.
 bool ModuleCommon_checkAutoScreenOffTimeout(void);
 
 // Check toast state: if active and not expired, sets dirty=1; if expired, clears message and sets dirty=1.

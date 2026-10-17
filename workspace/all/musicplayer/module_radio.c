@@ -63,9 +63,6 @@ static RadioInternalState help_return_state = RADIO_INTERNAL_ADD_COUNTRY;
 static int sorted_station_indices[256];
 static int sorted_station_count = 0;
 
-// Screen off state
-static bool screen_off = false;
-
 // Last rendered metadata (for change detection)
 static char last_rendered_artist[256] = "";
 static char last_rendered_title[256] = "";
@@ -165,15 +162,16 @@ ModuleExitReason RadioModule_run(SDL_Surface* screen) {
 	bool dirty = true;
 	IndicatorType show_setting = INDICATOR_NONE;
 
-	screen_off = false;
-	ModuleCommon_resetScreenOffHint();
+	ModuleCommon_setScreenOff(false);
 	ModuleCommon_recordInputTime();
 	radio_toast_message[0] = '\0';
 	show_confirm = false;
 
-	// Re-enter playing state using the owner's URL, not the previous UI cursor.
-	// A deleted/unknown station deliberately leaves the cursor at -1 so the UI
-	// does not claim that a different saved station is playing.
+	// Re-enter with the owner's URL, not the previous UI cursor. A
+	// deleted/unknown station deliberately leaves the cursor at -1 so the UI
+	// does not claim that a different saved station is playing. Stay on the
+	// LIST page even when a station is already playing — the user can open the
+	// playing view explicitly from the list.
 	MusicClient_update();
 	if (Background_getActive() == BG_RADIO && MusicClient_isRadioActive()) {
 		restore_radio_cursor();
@@ -182,12 +180,24 @@ ModuleExitReason RadioModule_run(SDL_Surface* screen) {
 		last_rendered_artist[0] = '\0';
 		last_rendered_title[0] = '\0';
 		last_artwork_path[0] = '\0';
-		state = RADIO_INTERNAL_PLAYING;
 	}
 
 	while (1) {
 		GFX_startFrame();
 		PAD_poll();
+
+		// 熄屏中（所有页面统一）：只处理唤醒输入（电源键亮屏回页、A 切歌），
+		// 其余输入忽略，页面恢复渲染由唤醒后的 dirty 驱动
+		if (ModuleCommon_isScreenOff()) {
+			DarkScreenAction action = ModuleCommon_handleDarkScreenInput();
+			if (action == DARK_SCREEN_WAKE)
+				dirty = 1;
+			else if (action == DARK_SCREEN_TOGGLE && state == RADIO_INTERNAL_PLAYING)
+				toggle_radio_playback();
+			MusicClient_update();
+			GFX_sync();
+			continue;
+		}
 
 		// Handle confirmation dialog
 		if (show_confirm) {
@@ -230,7 +240,7 @@ ModuleExitReason RadioModule_run(SDL_Surface* screen) {
 		}
 
 		// Handle global input (skip if screen off or hint active)
-		if (!screen_off && !ModuleCommon_isScreenOffHintActive()) {
+		if (!ModuleCommon_isScreenOff()) {
 			// Map internal state to app state for controls help context
 			int app_state_for_help;
 			switch (state) {
@@ -398,30 +408,17 @@ ModuleExitReason RadioModule_run(SDL_Surface* screen) {
 			}
 			if (UI_listViewBusy(v))
 				dirty = 1;
+
+			// 播放中自动熄屏（无输入超时 → 直接灭屏）
+			if (MusicClient_snapshot()->source_state == MUSIC_RADIO_PLAYING &&
+				ModuleCommon_checkAutoScreenOffTimeout())
+				dirty = 1;
 		}
 		// =========================================
 		// RADIO PLAYING STATE
 		// =========================================
 		else if (state == RADIO_INTERNAL_PLAYING) {
 			ModuleCommon_setAutosleepDisabled(true);
-
-			// Screen off hint or screen off: A still toggles play/pause
-			// (the waking frame ends here so its A press doesn't also toggle)
-			if (screen_off || ModuleCommon_isScreenOffHintActive()) {
-				DarkScreenAction action = ModuleCommon_handleDarkScreenInput(screen, &screen_off);
-				if (action == DARK_SCREEN_WAKE)
-					dirty = 1;
-				else if (action == DARK_SCREEN_TOGGLE)
-					toggle_radio_playback();
-				if (ModuleCommon_processScreenOffHintTimeout()) {
-					screen_off = true;
-					GFX_clear(screen);
-					GFX_flip(screen);
-				}
-				MusicClient_update();
-				GFX_sync();
-				continue;
-			}
 
 			// Reset input timer on any button press
 			if (PAD_anyPressed()) {
@@ -469,7 +466,7 @@ ModuleExitReason RadioModule_run(SDL_Surface* screen) {
 				toggle_radio_playback();
 				dirty = 1;
 			} else if (PAD_tappedSelect(SDL_GetTicks())) {
-				ModuleCommon_startScreenOffHint();
+				ModuleCommon_setScreenOff(true); // SELECT 快捷熄屏
 				GFX_clearLayers(LAYER_SCROLLTEXT);
 				PLAT_clearLayers(LAYER_BUFFER);
 				PLAT_GPU_Flip();
@@ -500,7 +497,7 @@ ModuleExitReason RadioModule_run(SDL_Surface* screen) {
 			}
 
 			// Animate radio GPU layer
-			if (!screen_off && !ModuleCommon_isScreenOffHintActive()) {
+			if (!ModuleCommon_isScreenOff()) {
 				if (RadioStatus_needsRefresh()) {
 					RadioStatus_renderGPU();
 				}
@@ -623,7 +620,7 @@ ModuleExitReason RadioModule_run(SDL_Surface* screen) {
 		}
 
 		// Handle power management
-		if (!screen_off && !ModuleCommon_isScreenOffHintActive()) {
+		if (!ModuleCommon_isScreenOff()) {
 			ModuleCommon_PWR_update(&dirty, &show_setting);
 		}
 
@@ -633,38 +630,33 @@ ModuleExitReason RadioModule_run(SDL_Surface* screen) {
 		if ((dirty ||
 			 (state == RADIO_INTERNAL_LIST && UI_listViewBusy(RadioList_view())) ||
 			 (state == RADIO_INTERNAL_ADD_COUNTRY && UI_listViewBusy(RadioCountries_view()))) &&
-			!screen_off) {
-			if (ModuleCommon_isScreenOffHintActive()) {
-				GFX_clear(screen);
-				render_screen_off_hint(screen);
-			} else {
-				switch (state) {
-				case RADIO_INTERNAL_LIST:
-					render_radio_list(screen, show_setting,
-									  radio_toast_message, radio_toast_time);
-					break;
-				case RADIO_INTERNAL_PLAYING: {
-					render_radio_playing(screen, show_setting, RadioList_view()->selected);
-					const MusicSnapshotWire* snapshot = MusicClient_snapshot();
-					strncpy(last_rendered_artist, snapshot->artist, sizeof(last_rendered_artist) - 1);
-					last_rendered_artist[sizeof(last_rendered_artist) - 1] = '\0';
-					strncpy(last_rendered_title, snapshot->title, sizeof(last_rendered_title) - 1);
-					last_rendered_title[sizeof(last_rendered_title) - 1] = '\0';
-					break;
-				}
-				case RADIO_INTERNAL_ADD_COUNTRY:
-					render_radio_add(screen, show_setting, radio_toast_message, radio_toast_time);
-					break;
-				case RADIO_INTERNAL_ADD_STATIONS:
-					render_radio_add_stations(screen, show_setting, add_selected_country_code,
-											  add_station_selected, &add_station_scroll,
-											  sorted_station_indices, sorted_station_count,
-											  radio_toast_message, radio_toast_time);
-					break;
-				case RADIO_INTERNAL_HELP:
-					render_radio_help(screen, show_setting, &help_scroll);
-					break;
-				}
+			!ModuleCommon_isScreenOff()) {
+			switch (state) {
+			case RADIO_INTERNAL_LIST:
+				render_radio_list(screen, show_setting,
+								  radio_toast_message, radio_toast_time);
+				break;
+			case RADIO_INTERNAL_PLAYING: {
+				render_radio_playing(screen, show_setting, RadioList_view()->selected);
+				const MusicSnapshotWire* snapshot = MusicClient_snapshot();
+				strncpy(last_rendered_artist, snapshot->artist, sizeof(last_rendered_artist) - 1);
+				last_rendered_artist[sizeof(last_rendered_artist) - 1] = '\0';
+				strncpy(last_rendered_title, snapshot->title, sizeof(last_rendered_title) - 1);
+				last_rendered_title[sizeof(last_rendered_title) - 1] = '\0';
+				break;
+			}
+			case RADIO_INTERNAL_ADD_COUNTRY:
+				render_radio_add(screen, show_setting, radio_toast_message, radio_toast_time);
+				break;
+			case RADIO_INTERNAL_ADD_STATIONS:
+				render_radio_add_stations(screen, show_setting, add_selected_country_code,
+										  add_station_selected, &add_station_scroll,
+										  sorted_station_indices, sorted_station_count,
+										  radio_toast_message, radio_toast_time);
+				break;
+			case RADIO_INTERNAL_HELP:
+				render_radio_help(screen, show_setting, &help_scroll);
+				break;
 			}
 
 			GFX_flip(screen);
@@ -675,7 +667,7 @@ ModuleExitReason RadioModule_run(SDL_Surface* screen) {
 				state == RADIO_INTERNAL_ADD_STATIONS) {
 				ModuleCommon_tickToast(radio_toast_message, radio_toast_time, &dirty);
 			}
-		} else if (!screen_off) {
+		} else if (!ModuleCommon_isScreenOff()) {
 			// Idle marquee tick for the active list view (activate-after-
 			// delay + steady GPU scroll happen here, not via dirty).
 			if (state == RADIO_INTERNAL_LIST)

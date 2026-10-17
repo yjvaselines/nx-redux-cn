@@ -15,17 +15,9 @@ void Settings_setAudioValues(int bass_filter_hz, float soft_limiter_threshold,
 // Cleanup settings (saves and frees resources)
 void Settings_quit(void);
 
-// Screen off timeout setting (in seconds)
-// Values: 60, 90, 120, 0 (off)
+// Auto screen-off timeout in seconds. Always follows the system-wide screen
+// timeout (Settings.pak), so there is no in-app setting for it.
 int Settings_getScreenOffTimeout(void);
-
-// Cycle through screen off timeout values
-void Settings_cycleScreenOffNext(void); // 60 -> 90 -> 120 -> Off -> 60
-void Settings_cycleScreenOffPrev(void); // 60 -> Off -> 120 -> 90 -> 60
-
-// Get display string for current screen off timeout
-// Returns: "60s", "90s", "120s", or "Off"
-const char* Settings_getScreenOffDisplayStr(void);
 
 // Lyrics enabled setting
 bool Settings_getLyricsEnabled(void);

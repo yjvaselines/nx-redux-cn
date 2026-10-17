@@ -60,19 +60,13 @@ int MenuModule_run(SDL_Surface* screen) {
 	MusicClient_update();
 	ModuleCommon_setAutosleepDisabled(Background_isPlaying());
 
-	// 播放中的熄屏/提示：只处理唤醒输入（电源键亮屏、A 切歌），其余忽略
-	static bool screen_off = false;
-	if (Background_isPlaying() && (screen_off || ModuleCommon_isScreenOffHintActive())) {
-		DarkScreenAction action = ModuleCommon_handleDarkScreenInput(screen, &screen_off);
+	// 播放中的熄屏：只处理唤醒输入（电源键亮屏、A 切歌），其余忽略
+	if (Background_isPlaying() && ModuleCommon_isScreenOff()) {
+		DarkScreenAction action = ModuleCommon_handleDarkScreenInput();
 		if (action == DARK_SCREEN_WAKE)
 			dirty = 1;
 		else if (action == DARK_SCREEN_TOGGLE)
 			MusicClient_toggle();
-		if (ModuleCommon_processScreenOffHintTimeout()) {
-			screen_off = true;
-			GFX_clear(screen);
-			GFX_flip(screen);
-		}
 		MusicClient_update();
 		GFX_sync();
 		continue;

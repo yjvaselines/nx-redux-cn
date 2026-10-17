@@ -75,9 +75,6 @@ static void player_show_toast(const char* msg) {
 	player_toast_time = SDL_GetTicks();
 }
 
-// Screen off state (module-local)
-static bool screen_off = false;
-
 // Set by a START tap on Now Playing: leave the app and keep playback running
 // (the same outcome as "Yes" on the quit modal's background-playback prompt).
 static bool exit_to_background = false;
@@ -449,22 +446,16 @@ static bool handle_browser_input(PlayerInternalState* state, bool* dirty) {
 
 // Handle input in playing state. Returns true when main loop should continue (skip render).
 static bool handle_playing_input(SDL_Surface* screen, PlayerInternalState* state, bool* dirty) {
-	// Screen off hint or screen off: A still toggles play/pause
-	if (screen_off || ModuleCommon_isScreenOffHintActive()) {
+	// Screen off: A still toggles play/pause
+	if (ModuleCommon_isScreenOff()) {
 		// (the waking frame ends here so its A press doesn't also toggle)
-		DarkScreenAction action = ModuleCommon_handleDarkScreenInput(screen, &screen_off);
+		DarkScreenAction action = ModuleCommon_handleDarkScreenInput();
 		if (action == DARK_SCREEN_WAKE)
 			*dirty = 1;
 		else if (action == DARK_SCREEN_TOGGLE)
 			MusicClient_toggle();
-		if (ModuleCommon_processScreenOffHintTimeout()) {
-			screen_off = true;
-			GFX_clear(screen);
-			GFX_flip(screen);
-		}
 		MusicClient_update();
-		if (screen_off)
-			ModuleCommon_setAutosleepDisabled(Background_isPlaying());
+		ModuleCommon_setAutosleepDisabled(Background_isPlaying());
 		GFX_sync();
 		return true;
 	}
@@ -524,7 +515,7 @@ static bool handle_playing_input(SDL_Surface* screen, PlayerInternalState* state
 		}
 		*dirty = 1;
 	} else if (PAD_tappedSelect(SDL_GetTicks())) {
-		ModuleCommon_startScreenOffHint();
+		ModuleCommon_setScreenOff(true); // SELECT 快捷熄屏
 		clear_gpu_layers();
 		*dirty = 1;
 	}
@@ -547,8 +538,8 @@ static bool handle_playing_input(SDL_Surface* screen, PlayerInternalState* state
 	}
 
 
-	// Animate player GPU layers (skip if screen-off hint just activated)
-	if (!ModuleCommon_isScreenOffHintActive()) {
+	// Animate player GPU layers (skip while the screen is off)
+	if (!ModuleCommon_isScreenOff()) {
 		if (player_needs_scroll_refresh()) {
 			player_animate_scroll();
 		}
@@ -576,8 +567,7 @@ ModuleExitReason PlayerModule_run(SDL_Surface* screen) {
 	bool dirty = true;
 	IndicatorType show_setting = INDICATOR_NONE;
 
-	screen_off = false;
-	ModuleCommon_resetScreenOffHint();
+	ModuleCommon_setScreenOff(false);
 	ModuleCommon_recordInputTime();
 
 	// Reclaim background music — re-enter playing state. The owner snapshot is
@@ -656,7 +646,7 @@ ModuleExitReason PlayerModule_run(SDL_Surface* screen) {
 		}
 
 		// Handle global input (skip if screen off or hint active)
-		if (!screen_off && !ModuleCommon_isScreenOffHintActive()) {
+		if (!ModuleCommon_isScreenOff()) {
 			int app_state_for_help = (state == PLAYER_INTERNAL_BROWSER) ? 1 : 2; // STATE_BROWSER=1, STATE_PLAYING=2
 
 			// Context menu for the browser page: acts on the selected entry
@@ -738,7 +728,7 @@ ModuleExitReason PlayerModule_run(SDL_Surface* screen) {
 		}
 
 		// Handle power management
-		if (!screen_off && !ModuleCommon_isScreenOffHintActive()) {
+		if (!ModuleCommon_isScreenOff()) {
 			ModuleCommon_PWR_update(&dirty, &show_setting);
 		}
 
@@ -755,11 +745,8 @@ ModuleExitReason PlayerModule_run(SDL_Surface* screen) {
 		// Render. The busy check keeps the dirty-flag loop redrawing while
 		// the browser view's pill glides or its marquee needs a main-surface
 		// render.
-		if ((dirty || (state == PLAYER_INTERNAL_BROWSER && UI_listViewBusy(MusicBrowser_view()))) && !screen_off) {
-			if (ModuleCommon_isScreenOffHintActive()) {
-				GFX_clear(screen);
-				render_screen_off_hint(screen);
-			} else if (state == PLAYER_INTERNAL_BROWSER) {
+		if ((dirty || (state == PLAYER_INTERNAL_BROWSER && UI_listViewBusy(MusicBrowser_view()))) && !ModuleCommon_isScreenOff()) {
+			if (state == PLAYER_INTERNAL_BROWSER) {
 				render_browser(screen, show_setting, &browser);
 			} else {
 				int pl_track = playlist_active ? Playlist_getCurrentIndex(&playlist) + 1 : 0;
@@ -782,7 +769,7 @@ ModuleExitReason PlayerModule_run(SDL_Surface* screen) {
 			dirty = 0;
 
 			ModuleCommon_tickToast(player_toast_message, player_toast_time, &dirty);
-		} else if (!screen_off) {
+		} else if (!ModuleCommon_isScreenOff()) {
 			// Idle marquee tick for the browser view (activate-after-delay +
 			// steady GPU scroll happen here, not via dirty).
 			if (state == PLAYER_INTERNAL_BROWSER)
@@ -844,8 +831,7 @@ ModuleExitReason PlayerModule_runWithPlaylist(SDL_Surface* screen,
 
 	bool dirty = true;
 	IndicatorType show_setting = INDICATOR_NONE;
-	screen_off = false;
-	ModuleCommon_resetScreenOffHint();
+	ModuleCommon_recordInputTime();
 	ModuleCommon_recordInputTime();
 
 	while (1) {
@@ -873,7 +859,7 @@ ModuleExitReason PlayerModule_runWithPlaylist(SDL_Surface* screen,
 		}
 
 		// Handle global input (skip if screen off or hint active)
-		if (!screen_off && !ModuleCommon_isScreenOffHintActive()) {
+		if (!ModuleCommon_isScreenOff()) {
 			GlobalInputResult global = ModuleCommon_handleGlobalInput(screen, &show_setting, 2, NULL, 0); // STATE_PLAYING=2
 			if (global.should_quit) {
 				cleanup_album_art_background();
@@ -888,22 +874,16 @@ ModuleExitReason PlayerModule_runWithPlaylist(SDL_Surface* screen,
 			}
 		}
 
-		// Screen off hint or screen off: A still toggles play/pause
-		if (screen_off || ModuleCommon_isScreenOffHintActive()) {
+		// Screen off: A still toggles play/pause
+		if (ModuleCommon_isScreenOff()) {
 			// (the waking frame ends here so its A press doesn't also toggle)
-			DarkScreenAction action = ModuleCommon_handleDarkScreenInput(screen, &screen_off);
+			DarkScreenAction action = ModuleCommon_handleDarkScreenInput();
 			if (action == DARK_SCREEN_WAKE)
 				dirty = 1;
 			else if (action == DARK_SCREEN_TOGGLE)
 				MusicClient_toggle();
-			if (ModuleCommon_processScreenOffHintTimeout()) {
-				screen_off = true;
-				GFX_clear(screen);
-				GFX_flip(screen);
-			}
 			MusicClient_update();
-			if (screen_off)
-				ModuleCommon_setAutosleepDisabled(Background_isPlaying());
+			ModuleCommon_setAutosleepDisabled(Background_isPlaying());
 			GFX_sync();
 			continue;
 		}
@@ -961,7 +941,7 @@ ModuleExitReason PlayerModule_runWithPlaylist(SDL_Surface* screen,
 			}
 			dirty = 1;
 		} else if (PAD_tappedSelect(SDL_GetTicks())) {
-			ModuleCommon_startScreenOffHint();
+			ModuleCommon_setScreenOff(true); // SELECT 快捷熄屏
 			clear_gpu_layers();
 			dirty = 1;
 		}
@@ -983,7 +963,7 @@ ModuleExitReason PlayerModule_runWithPlaylist(SDL_Surface* screen,
 		}
 
 		// Animate player GPU layers
-		if (!ModuleCommon_isScreenOffHintActive()) {
+		if (!ModuleCommon_isScreenOff()) {
 			if (player_needs_scroll_refresh()) {
 				player_animate_scroll();
 			}
@@ -1001,7 +981,7 @@ ModuleExitReason PlayerModule_runWithPlaylist(SDL_Surface* screen,
 		}
 
 		// Handle power management
-		if (!screen_off && !ModuleCommon_isScreenOffHintActive()) {
+		if (!ModuleCommon_isScreenOff()) {
 			ModuleCommon_PWR_update(&dirty, &show_setting);
 		}
 
@@ -1016,15 +996,10 @@ ModuleExitReason PlayerModule_runWithPlaylist(SDL_Surface* screen,
 		}
 
 		// Render
-		if (dirty && !screen_off) {
-			if (ModuleCommon_isScreenOffHintActive()) {
-				GFX_clear(screen);
-				render_screen_off_hint(screen);
-			} else {
-				int pl_track = Playlist_getCurrentIndex(&playlist) + 1;
-				int pl_total = Playlist_getCount(&playlist);
-				render_playing(screen, show_setting, &browser, shuffle_enabled, repeat_enabled, pl_track, pl_total);
-			}
+		if (dirty && !ModuleCommon_isScreenOff()) {
+			int pl_track = Playlist_getCurrentIndex(&playlist) + 1;
+			int pl_total = Playlist_getCount(&playlist);
+			render_playing(screen, show_setting, &browser, shuffle_enabled, repeat_enabled, pl_track, pl_total);
 
 			// Show add-to-playlist toast (if still active after auto-clear check)
 			atp_toast = AddToPlaylist_getToastMessage();
@@ -1034,7 +1009,7 @@ ModuleExitReason PlayerModule_runWithPlaylist(SDL_Surface* screen,
 
 			GFX_flip(screen);
 			dirty = 0;
-		} else if (!screen_off) {
+		} else if (!ModuleCommon_isScreenOff()) {
 			GFX_sync();
 		}
 	}
@@ -1090,8 +1065,7 @@ ModuleExitReason PlayerModule_runResume(SDL_Surface* screen, const ResumeState* 
 		// Use the shared playing loop via handle_playing_input
 		bool dirty = true;
 		IndicatorType show_setting = INDICATOR_NONE;
-		screen_off = false;
-		ModuleCommon_resetScreenOffHint();
+		ModuleCommon_setScreenOff(false);
 		ModuleCommon_recordInputTime();
 		PlayerInternalState state = PLAYER_INTERNAL_PLAYING;
 
@@ -1118,7 +1092,7 @@ ModuleExitReason PlayerModule_runResume(SDL_Surface* screen, const ResumeState* 
 			}
 
 			// Handle global input
-			if (!screen_off && !ModuleCommon_isScreenOffHintActive()) {
+			if (!ModuleCommon_isScreenOff()) {
 				GlobalInputResult global = ModuleCommon_handleGlobalInput(screen, &show_setting, 2, NULL, 0);
 				if (global.should_quit) {
 					cleanup_album_art_background();
@@ -1155,7 +1129,7 @@ ModuleExitReason PlayerModule_runResume(SDL_Surface* screen, const ResumeState* 
 			}
 
 			// Handle power management
-			if (!screen_off && !ModuleCommon_isScreenOffHintActive()) {
+			if (!ModuleCommon_isScreenOff()) {
 				ModuleCommon_PWR_update(&dirty, &show_setting);
 			}
 
@@ -1170,15 +1144,10 @@ ModuleExitReason PlayerModule_runResume(SDL_Surface* screen, const ResumeState* 
 			}
 
 			// Render
-			if (dirty && !screen_off) {
-				if (ModuleCommon_isScreenOffHintActive()) {
-					GFX_clear(screen);
-					render_screen_off_hint(screen);
-				} else {
-					int pl_track = Playlist_getCurrentIndex(&playlist) + 1;
-					int pl_total = Playlist_getCount(&playlist);
-					render_playing(screen, show_setting, &browser, shuffle_enabled, repeat_enabled, pl_track, pl_total);
-				}
+			if (dirty && !ModuleCommon_isScreenOff()) {
+				int pl_track = Playlist_getCurrentIndex(&playlist) + 1;
+				int pl_total = Playlist_getCount(&playlist);
+				render_playing(screen, show_setting, &browser, shuffle_enabled, repeat_enabled, pl_track, pl_total);
 
 				atp_toast = AddToPlaylist_getToastMessage();
 				if (atp_toast && atp_toast[0]) {
@@ -1187,7 +1156,7 @@ ModuleExitReason PlayerModule_runResume(SDL_Surface* screen, const ResumeState* 
 
 				GFX_flip(screen);
 				dirty = 0;
-			} else if (!screen_off) {
+			} else if (!ModuleCommon_isScreenOff()) {
 				GFX_sync();
 			}
 		}

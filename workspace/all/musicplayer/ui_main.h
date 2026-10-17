@@ -18,7 +18,4 @@ void render_menu(SDL_Surface* screen, IndicatorType show_setting,
 // Render controls help dialog overlay
 void render_controls_help(SDL_Surface* screen, int app_state);
 
-// Render screen off hint message
-void render_screen_off_hint(SDL_Surface* screen);
-
 #endif

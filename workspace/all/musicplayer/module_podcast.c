@@ -61,9 +61,6 @@ static int confirm_target_index = -1;
 static char confirm_podcast_name[256] = "";
 static int confirm_return_state = 0; // 0 = menu, 1 = top_shows, 2 = search_results
 
-// Screen off state
-static bool screen_off = false;
-
 // Context-menu item ids
 #define PODCAST_CTX_UNSUBSCRIBE 1	   // menu: unsubscribe selected podcast
 #define PODCAST_CTX_MANAGE 2		   // menu: manage podcasts
@@ -109,14 +106,12 @@ static void toggle_podcast_playback(void) {
 		MusicClient_pause();
 }
 
-static void clear_and_show_screen_off_hint(SDL_Surface* screen) {
+static void clear_for_screen_off(SDL_Surface* screen) {
 	GFX_clearLayers(LAYER_SCROLLTEXT);
 	PLAT_clearLayers(LAYER_BUFFER);
 	PLAT_clearLayers(LAYER_PODCAST_PROGRESS);
 	PLAT_GPU_Flip();
-	GFX_clear(screen);
-	render_screen_off_hint(screen);
-	GFX_flip(screen);
+	ModuleCommon_setScreenOff(true); // 直接熄屏
 }
 
 static void return_to_episodes(PodcastInternalState* state, bool* dirty) {
@@ -147,8 +142,7 @@ ModuleExitReason PodcastModule_run(SDL_Surface* screen) {
 	bool dirty = true;
 	IndicatorType show_setting = INDICATOR_NONE;
 
-	screen_off = false;
-	ModuleCommon_resetScreenOffHint();
+	ModuleCommon_setScreenOff(false);
 	ModuleCommon_recordInputTime();
 	podcast_toast_message[0] = '\0';
 	show_confirm = false;
@@ -207,7 +201,7 @@ ModuleExitReason PodcastModule_run(SDL_Surface* screen) {
 		}
 
 		// Handle global input (skip if screen off or hint active)
-		if (!screen_off && !ModuleCommon_isScreenOffHintActive()) {
+		if (!ModuleCommon_isScreenOff()) {
 			int app_state_for_help;
 			switch (state) {
 			case PODCAST_INTERNAL_MENU:
@@ -931,19 +925,14 @@ ModuleExitReason PodcastModule_run(SDL_Surface* screen) {
 		else if (state == PODCAST_INTERNAL_PLAYING) {
 			ModuleCommon_setAutosleepDisabled(true);
 
-			// Screen off hint or screen off: A still toggles play/pause
+			// Screen off: A still toggles play/pause
 			// (the waking frame ends here so its A press doesn't also toggle)
-			if (screen_off || ModuleCommon_isScreenOffHintActive()) {
-				DarkScreenAction action = ModuleCommon_handleDarkScreenInput(screen, &screen_off);
+			if (ModuleCommon_isScreenOff()) {
+				DarkScreenAction action = ModuleCommon_handleDarkScreenInput();
 				if (action == DARK_SCREEN_WAKE)
 					dirty = 1;
 				else if (action == DARK_SCREEN_TOGGLE)
 					toggle_podcast_playback();
-				if (ModuleCommon_processScreenOffHintTimeout()) {
-					screen_off = true;
-					GFX_clear(screen);
-					GFX_flip(screen);
-				}
 				// Handle USB/Bluetooth media and volume buttons even with screen off
 				Podcast_update();
 				GFX_sync();
@@ -977,8 +966,8 @@ ModuleExitReason PodcastModule_run(SDL_Surface* screen) {
 						continue;
 					}
 				} else if (PAD_tappedSelect(SDL_GetTicks())) {
-					ModuleCommon_startScreenOffHint();
-					clear_and_show_screen_off_hint(screen);
+					ModuleCommon_setScreenOff(true); // SELECT 快捷熄屏
+				clear_for_screen_off(screen);
 					continue;
 				} else if (PAD_justRepeated(BTN_LEFT)) {
 					int pos_ms = MusicClient_position();
@@ -1038,28 +1027,24 @@ ModuleExitReason PodcastModule_run(SDL_Surface* screen) {
 
 				// Auto screen-off
 				if (MusicClient_isPodcastActive() && ModuleCommon_checkAutoScreenOffTimeout()) {
-					clear_and_show_screen_off_hint(screen);
+					clear_for_screen_off(screen);
 					continue;
 				}
 			}
 		}
 
 		// Handle power management
-		if (!screen_off && !ModuleCommon_isScreenOffHintActive()) {
+		if (!ModuleCommon_isScreenOff()) {
 			ModuleCommon_PWR_update(&dirty, &show_setting);
 		}
 
 		// Render
-		if (dirty && !screen_off) {
-			if (ModuleCommon_isScreenOffHintActive()) {
-				GFX_clear(screen);
-				render_screen_off_hint(screen);
-			} else {
-				switch (state) {
-				case PODCAST_INTERNAL_MENU:
-					render_podcast_main_page(screen, show_setting, podcast_menu_selected, &podcast_menu_scroll,
-											 podcast_toast_message, podcast_toast_time);
-					break;
+		if (dirty && !ModuleCommon_isScreenOff()) {
+			switch (state) {
+			case PODCAST_INTERNAL_MENU:
+				render_podcast_main_page(screen, show_setting, podcast_menu_selected, &podcast_menu_scroll,
+										 podcast_toast_message, podcast_toast_time);
+				break;
 				case PODCAST_INTERNAL_MANAGE:
 					render_podcast_manage(screen, show_setting, podcast_manage_selected, Podcast_getSubscriptionCount());
 					break;
@@ -1100,16 +1085,15 @@ ModuleExitReason PodcastModule_run(SDL_Surface* screen) {
 												  podcast_toast_message, podcast_toast_time);
 					break;
 				}
+
+				GFX_flip(screen);
+				dirty = 0;
+
+				// Toast refresh
+				ModuleCommon_tickToast(podcast_toast_message, podcast_toast_time, &dirty);
+			} else if (!ModuleCommon_isScreenOff()) {
+				GFX_sync();
 			}
-
-			GFX_flip(screen);
-			dirty = 0;
-
-			// Toast refresh
-			ModuleCommon_tickToast(podcast_toast_message, podcast_toast_time, &dirty);
-		} else if (!screen_off) {
-			GFX_sync();
-		}
 	}
 }
 
