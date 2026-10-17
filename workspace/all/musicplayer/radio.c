@@ -22,6 +22,7 @@
 #include <dirent.h>
 #include <sys/stat.h>
 #include <time.h>
+#include <stdarg.h>
 
 #include "defines.h"
 #include "api.h"
@@ -64,7 +65,7 @@ typedef enum {
 #define RADIO_STATIONS_FILE SHARED_USERDATA_PATH "/music-player/radio/stations.txt"
 
 // Ring buffer for decoded audio
-#define AUDIO_RING_SIZE (SAMPLE_RATE * 2 * 10) // 10 seconds of stereo audio
+#define AUDIO_RING_SIZE (SAMPLE_RATE * 2 * 20) // 20 seconds of stereo audio (~3.75 MB)
 
 // Default radio stations
 static RadioStation default_stations[] = {
@@ -214,8 +215,10 @@ static int radio_ring_count_snapshot(void) {
 }
 
 static void radio_start_playing_if_buffered(void) {
+	// 起播用绝对水位（3 秒）而非 ring 比例：ring 加大到 20s 后比例阈值会让
+	// 起播等待线性变长；3 秒在解码慢的设备上 1 秒左右即可攒够。
 	if (radio_state_load() == RADIO_STATE_BUFFERING &&
-		radio_ring_count_snapshot() > AUDIO_RING_SIZE * 2 / 3)
+		radio_ring_count_snapshot() > SAMPLE_RATE * 2 * 3)
 		radio_state_store(RADIO_STATE_PLAYING);
 }
 
@@ -851,6 +854,26 @@ static void start_segment_prefetch(int segment_idx) {
 	}
 }
 
+// Per-segment timing debug: the daemon's stdout/stderr are redirected to
+// /dev/null when forked by the UI, so /tmp/radio_hls.log is the only
+// observable output. One line per segment (~3s), negligible overhead.
+static uint32_t hls_now_ms(void) {
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (uint32_t)((uint64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000);
+}
+
+static void hls_debug_log(const char* fmt, ...) {
+	FILE* f = fopen("/tmp/radio_hls.log", "a");
+	if (!f)
+		return;
+	va_list ap;
+	va_start(ap, fmt);
+	vfprintf(f, fmt, ap);
+	va_end(ap);
+	fclose(f);
+}
+
 // HLS streaming thread
 static void* hls_stream_thread_func(void* arg) {
 	(void)arg;
@@ -955,6 +978,7 @@ static void* hls_stream_thread_func(void* arg) {
 		const char* seg_url = radio.hls.segments[radio.hls.current_segment].url;
 		const char* seg_title = radio.hls.segments[radio.hls.current_segment].title;
 		const char* seg_artist = radio.hls.segments[radio.hls.current_segment].artist;
+		uint32_t fetch_start = hls_now_ms();
 
 		// Save old metadata BEFORE any updates to detect changes for album art fetch
 		char old_artist[256], old_title[256];
@@ -1014,6 +1038,8 @@ static void* hls_stream_thread_func(void* arg) {
 				continue;
 			}
 		}
+		uint32_t fetch_ms = hls_now_ms() - fetch_start;
+		uint32_t decode_start = hls_now_ms();
 
 		// Start prefetching next segment in background while we process current one
 		int next_seg = radio.hls.current_segment + 1;
@@ -1092,7 +1118,11 @@ static void* hls_stream_thread_func(void* arg) {
 				// leaves ~1s of headroom, then a whole multi-second segment is
 				// decoded at once and the overflow is silently dropped by
 				// radio_ring_write. Pause here until the callback drains the ring.
+				// 背压等待中也要做起播检查：PLAYING 检查平时在段尾，若单段
+				// 解码量就足以把 ring 从 <3s 顶到 90%，BUFFERING 期间 callback
+				// 不消耗 ring，这里会死等——水位过 3s 即切 PLAYING 解锁。
 				while (radio_ring_count_snapshot() > AUDIO_RING_SIZE * 9 / 10 && !radio.should_stop) {
+					radio_start_playing_if_buffered();
 					usleep(20000); // 20ms
 				}
 				if (radio.should_stop)
@@ -1149,11 +1179,16 @@ static void* hls_stream_thread_func(void* arg) {
 			}
 		}
 
-		// Transition to PLAYING once the ring is ~2/3 full. The old threshold
-		// (> AUDIO_RING_SIZE, i.e. the whole 10s ring) was unsatisfiable because
-		// radio_ring_write caps count at AUDIO_RING_SIZE, so HLS streams stayed
-		// in BUFFERING forever and auto screen-off never fired.
+		// Transition to PLAYING once ~3s is buffered (see
+		// radio_start_playing_if_buffered: an absolute threshold, since a
+		// proportional one would scale with the ring size).
 		radio_start_playing_if_buffered();
+
+		hls_debug_log("seg=%d len=%d%s fetch=%ums decode=%ums ring=%d%% state=%d\n",
+					  radio.hls.current_segment, seg_len, use_prefetch ? " pre" : "",
+					  fetch_ms, hls_now_ms() - decode_start,
+					  radio_ring_count_snapshot() * 100 / AUDIO_RING_SIZE,
+					  (int)radio_state_load());
 
 		// Track the sequence number of the segment we just played (before incrementing)
 		radio.hls.last_played_sequence = radio.hls.media_sequence + radio.hls.current_segment;
@@ -2105,10 +2140,17 @@ int Radio_getAudioSamples(int16_t* buffer, int max_samples) {
 
 	// Check for underrun and transition to buffering if needed
 	// This provides faster response than waiting for Radio_update()
-	// But continue to provide remaining audio to avoid abrupt silence
 	if (radio_state_load() == RADIO_STATE_PLAYING && radio.audio_ring_count < SAMPLE_RATE * 2 * 2) {
 		radio_state_store(RADIO_STATE_BUFFERING);
-		// Don't return early - continue to drain remaining buffer smoothly
+	}
+
+	// BUFFERING 期间不消耗 ring：callback 若在缓冲阶段继续实时放音，
+	// 解码慢的设备（生产/消费比接近 1）永远攒不到起播水位 → 无限缓冲。
+	// 返回静音，攒到起播阈值后切 PLAYING，短暂静音换连续播放。
+	if (radio_state_load() != RADIO_STATE_PLAYING) {
+		memset(buffer, 0, max_samples * sizeof(int16_t));
+		pthread_mutex_unlock(&radio.audio_mutex);
+		return max_samples;
 	}
 
 	int samples_to_read = max_samples;

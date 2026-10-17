@@ -1525,8 +1525,8 @@ static void audio_callback(void* userdata, Uint8* stream, int len) {
 	// Check if radio is active - handle radio audio separately
 	if (Radio_isActive()) {
 		RadioState state = Radio_getState();
-		// Get audio from radio module for both PLAYING and BUFFERING states
-		// This ensures we drain remaining buffer during rebuffer instead of abrupt silence
+		// BUFFERING 期间 Radio_getAudioSamples 内部返回静音且不消耗 ring：
+		// 缓冲阶段边攒边放会让解码慢的设备永远攒不到起播水位（无限缓冲）。
 		if (state == RADIO_STATE_PLAYING || state == RADIO_STATE_BUFFERING) {
 			// Get audio from radio module
 			int samples_got = Radio_getAudioSamples(out, samples_needed * AUDIO_CHANNELS);
