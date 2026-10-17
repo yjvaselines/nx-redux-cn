@@ -19,6 +19,15 @@ void Settings_quit(void);
 // timeout (Settings.pak), so there is no in-app setting for it.
 int Settings_getScreenOffTimeout(void);
 
+// 自动睡眠时间（分钟）：0=关，10/20/30/40/50/60。播放累计达到设定时长后
+// 由 daemon 自动停止播放；停止后系统休眠链恢复正常。
+int Settings_getAutoSleepMinutes(void);
+void Settings_cycleAutoSleepNext(void);
+void Settings_cycleAutoSleepPrev(void);
+const char* Settings_getAutoSleepDisplayStr(void);
+// 重新从磁盘读取 auto_sleep_minutes（daemon 侧定时刷新，感知 UI 的修改）
+void Settings_reloadAutoSleep(void);
+
 // Lyrics enabled setting
 bool Settings_getLyricsEnabled(void);
 void Settings_toggleLyrics(void);

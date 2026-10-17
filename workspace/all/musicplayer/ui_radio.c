@@ -200,14 +200,26 @@ void render_radio_playing(SDL_Surface* screen, IndicatorType show_setting, int r
 		info_y += SCALE1(18);
 	}
 
-	// Station name (extra large font) - white. Prefer the user's configured
+	// Station name - white. Prefer the user's configured
 	// name; fall back to the stream's ICY name only when we have none (some
-	// servers announce junk like the mount id, e.g. revma's "488kt4sbv4uvv")
+	// servers announce junk like the mount id, e.g. revma's "488kt4sbv4uvv").
+	// Auto-shrink the font until the name fits the full width (xlarge is the
+	// max); only the smallest allowed size falls back to truncation.
 	const char* station_name = (current_station && current_station->name[0]) ? current_station->name
 							   : meta->station_name[0]						 ? meta->station_name
 																			 : "未知电台";
-	GFX_truncateText(font.xlarge, station_name, truncated, max_w_full, 0);
-	SDL_Surface* name_surf = GFX_renderText(font.xlarge, truncated, COLOR_WHITE);
+	TTF_Font* name_fonts[] = {font.xlarge, font.title, font.large, font.medium};
+	TTF_Font* name_font = font.medium;
+	for (int i = 0; i < 4; i++) {
+		int name_w, name_h;
+		GFX_measureText(name_fonts[i], station_name, &name_w, &name_h);
+		if (name_w <= max_w_full) {
+			name_font = name_fonts[i];
+			break;
+		}
+	}
+	GFX_truncateText(name_font, station_name, truncated, max_w_full, 0);
+	SDL_Surface* name_surf = GFX_renderText(name_font, truncated, COLOR_WHITE);
 	if (name_surf) {
 		SDL_BlitSurface(name_surf, NULL, screen, &(SDL_Rect){SCALE1(PADDING), info_y});
 		info_y += name_surf->h + SCALE1(2);

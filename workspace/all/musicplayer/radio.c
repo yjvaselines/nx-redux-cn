@@ -854,26 +854,6 @@ static void start_segment_prefetch(int segment_idx) {
 	}
 }
 
-// Per-segment timing debug: the daemon's stdout/stderr are redirected to
-// /dev/null when forked by the UI, so /tmp/radio_hls.log is the only
-// observable output. One line per segment (~3s), negligible overhead.
-static uint32_t hls_now_ms(void) {
-	struct timespec ts;
-	clock_gettime(CLOCK_MONOTONIC, &ts);
-	return (uint32_t)((uint64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000);
-}
-
-static void hls_debug_log(const char* fmt, ...) {
-	FILE* f = fopen("/tmp/radio_hls.log", "a");
-	if (!f)
-		return;
-	va_list ap;
-	va_start(ap, fmt);
-	vfprintf(f, fmt, ap);
-	va_end(ap);
-	fclose(f);
-}
-
 // HLS streaming thread
 static void* hls_stream_thread_func(void* arg) {
 	(void)arg;
@@ -978,7 +958,6 @@ static void* hls_stream_thread_func(void* arg) {
 		const char* seg_url = radio.hls.segments[radio.hls.current_segment].url;
 		const char* seg_title = radio.hls.segments[radio.hls.current_segment].title;
 		const char* seg_artist = radio.hls.segments[radio.hls.current_segment].artist;
-		uint32_t fetch_start = hls_now_ms();
 
 		// Save old metadata BEFORE any updates to detect changes for album art fetch
 		char old_artist[256], old_title[256];
@@ -1038,8 +1017,6 @@ static void* hls_stream_thread_func(void* arg) {
 				continue;
 			}
 		}
-		uint32_t fetch_ms = hls_now_ms() - fetch_start;
-		uint32_t decode_start = hls_now_ms();
 
 		// Start prefetching next segment in background while we process current one
 		int next_seg = radio.hls.current_segment + 1;
@@ -1183,12 +1160,6 @@ static void* hls_stream_thread_func(void* arg) {
 		// radio_start_playing_if_buffered: an absolute threshold, since a
 		// proportional one would scale with the ring size).
 		radio_start_playing_if_buffered();
-
-		hls_debug_log("seg=%d len=%d%s fetch=%ums decode=%ums ring=%d%% state=%d\n",
-					  radio.hls.current_segment, seg_len, use_prefetch ? " pre" : "",
-					  fetch_ms, hls_now_ms() - decode_start,
-					  radio_ring_count_snapshot() * 100 / AUDIO_RING_SIZE,
-					  (int)radio_state_load());
 
 		// Track the sequence number of the segment we just played (before incrementing)
 		radio.hls.last_played_sequence = radio.hls.media_sequence + radio.hls.current_segment;

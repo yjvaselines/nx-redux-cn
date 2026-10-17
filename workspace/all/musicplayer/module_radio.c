@@ -438,16 +438,19 @@ ModuleExitReason RadioModule_run(SDL_Surface* screen) {
 				return MODULE_EXIT_QUIT;
 			}
 
-			if (PAD_justPressed(BTN_UP) || PAD_justPressed(BTN_R1)) {
+			// UP/L1 = 上一个电台（索引 -1），DOWN/R1 = 下一个（+1），
+			// 与列表页 ListView 的方向一致（ListView: UP-1 / DOWN+1）；
+			// 到边界回绕（保留原有回绕行为）。
+			if (PAD_justPressed(BTN_UP) || PAD_justPressed(BTN_L1)) {
 				if (station_count > 1) {
-					lv->selected = (lv->selected + 1) % station_count;
+					lv->selected = (lv->selected - 1 + station_count) % station_count;
 					MusicClient_pause();
 					MusicClient_loadRadio(stations[lv->selected].url);
 					dirty = 1;
 				}
-			} else if (PAD_justPressed(BTN_DOWN) || PAD_justPressed(BTN_L1)) {
+			} else if (PAD_justPressed(BTN_DOWN) || PAD_justPressed(BTN_R1)) {
 				if (station_count > 1) {
-					lv->selected = (lv->selected - 1 + station_count) % station_count;
+					lv->selected = (lv->selected + 1) % station_count;
 					MusicClient_pause();
 					MusicClient_loadRadio(stations[lv->selected].url);
 					dirty = 1;

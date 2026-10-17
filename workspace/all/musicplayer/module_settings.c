@@ -20,15 +20,17 @@ typedef enum {
 } SettingsState;
 
 // Settings menu items
-#define SETTINGS_ITEM_BALANCE 0
-#define SETTINGS_ITEM_BASS_FILTER 1
-#define SETTINGS_ITEM_SOFT_LIMITER 2
-#define SETTINGS_ITEM_SAMPLE_RATE 3
-#define SETTINGS_ITEM_RESAMPLER 4
-#define SETTINGS_ITEM_BUFFER 5
-#define SETTINGS_ITEM_CLEAR_CACHE 6
-#define SETTINGS_ITEM_CLEAR_LYRICS 7
-#define SETTINGS_ITEM_COUNT 8
+// 与 ui_settings.c 保持一致：自动睡眠置顶
+#define SETTINGS_ITEM_AUTO_SLEEP 0
+#define SETTINGS_ITEM_BALANCE 1
+#define SETTINGS_ITEM_BASS_FILTER 2
+#define SETTINGS_ITEM_SOFT_LIMITER 3
+#define SETTINGS_ITEM_SAMPLE_RATE 4
+#define SETTINGS_ITEM_RESAMPLER 5
+#define SETTINGS_ITEM_BUFFER 6
+#define SETTINGS_ITEM_CLEAR_CACHE 7
+#define SETTINGS_ITEM_CLEAR_LYRICS 8
+#define SETTINGS_ITEM_COUNT 9
 
 // Internal app state constants for controls help
 // These match the pattern used in ui_main.c
@@ -104,6 +106,9 @@ ModuleExitReason SettingsModule_run(SDL_Surface* screen) {
 				} else if (menu_selected == SETTINGS_ITEM_BUFFER) {
 					Settings_cycleBufferFramesPrev();
 					dirty = 1;
+				} else if (menu_selected == SETTINGS_ITEM_AUTO_SLEEP) {
+					Settings_cycleAutoSleepPrev();
+					dirty = 1;
 				}
 			} else if (PAD_justPressed(BTN_RIGHT)) {
 				if (menu_selected == SETTINGS_ITEM_BALANCE) {
@@ -133,6 +138,9 @@ ModuleExitReason SettingsModule_run(SDL_Surface* screen) {
 				} else if (menu_selected == SETTINGS_ITEM_BUFFER) {
 					Settings_cycleBufferFramesNext();
 					dirty = 1;
+				} else if (menu_selected == SETTINGS_ITEM_AUTO_SLEEP) {
+					Settings_cycleAutoSleepNext();
+					dirty = 1;
 				}
 			} else if (PAD_justPressed(BTN_A)) {
 				switch (menu_selected) {
@@ -154,6 +162,10 @@ ModuleExitReason SettingsModule_run(SDL_Surface* screen) {
 					break;
 				case SETTINGS_ITEM_BUFFER:
 					Settings_cycleBufferFramesNext();
+					dirty = 1;
+					break;
+				case SETTINGS_ITEM_AUTO_SLEEP:
+					Settings_cycleAutoSleepNext();
 					dirty = 1;
 					break;
 				case SETTINGS_ITEM_CLEAR_CACHE:

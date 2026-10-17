@@ -11,16 +11,17 @@
 #include "album_art.h"
 #include "lyrics.h"
 
-// Settings menu items
-#define SETTINGS_ITEM_BALANCE 0
-#define SETTINGS_ITEM_BASS_FILTER 1
-#define SETTINGS_ITEM_SOFT_LIMITER 2
-#define SETTINGS_ITEM_SAMPLE_RATE 3
-#define SETTINGS_ITEM_RESAMPLER 4
-#define SETTINGS_ITEM_BUFFER 5
-#define SETTINGS_ITEM_CLEAR_CACHE 6
-#define SETTINGS_ITEM_CLEAR_LYRICS 7
-#define SETTINGS_ITEM_COUNT 8
+// Settings menu items（自动睡眠置顶）
+#define SETTINGS_ITEM_AUTO_SLEEP 0
+#define SETTINGS_ITEM_BALANCE 1
+#define SETTINGS_ITEM_BASS_FILTER 2
+#define SETTINGS_ITEM_SOFT_LIMITER 3
+#define SETTINGS_ITEM_SAMPLE_RATE 4
+#define SETTINGS_ITEM_RESAMPLER 5
+#define SETTINGS_ITEM_BUFFER 6
+#define SETTINGS_ITEM_CLEAR_CACHE 7
+#define SETTINGS_ITEM_CLEAR_LYRICS 8
+#define SETTINGS_ITEM_COUNT 9
 
 // Format cache size as human-readable string
 static void format_cache_size(long bytes, char* buf, int buf_size) {
@@ -54,6 +55,7 @@ void render_settings_menu(SDL_Surface* screen, IndicatorType show_setting, int m
 
 	const char* balance_desc = balance_error && balance_error[0] ? balance_error : "调节游戏与音乐的混音比例";
 	UISettingsItem items[] = {
+		{.label = "自动睡眠", .value = Settings_getAutoSleepDisplayStr(), .swatch = -1, .cycleable = 1, .desc = "播放累计达到设定时长后自动停止"},
 		{.label = "声道平衡", .value = MusicBalance_getDisplayString(), .swatch = -1, .cycleable = 1, .desc = balance_desc},
 		{.label = "低音滤波", .value = Settings_getBassFilterDisplayStr(), .swatch = -1, .cycleable = 1, .desc = "高通滤波，减少扬声器失真"},
 		{.label = "软限幅", .value = Settings_getSoftLimiterDisplayStr(), .swatch = -1, .cycleable = 1, .desc = "限制音量峰值，防止削波失真"},
@@ -73,7 +75,8 @@ void render_settings_menu(SDL_Surface* screen, IndicatorType show_setting, int m
 						menu_selected == SETTINGS_ITEM_SOFT_LIMITER ||
 						menu_selected == SETTINGS_ITEM_SAMPLE_RATE ||
 						menu_selected == SETTINGS_ITEM_RESAMPLER ||
-						menu_selected == SETTINGS_ITEM_BUFFER);
+						menu_selected == SETTINGS_ITEM_BUFFER ||
+						menu_selected == SETTINGS_ITEM_AUTO_SLEEP);
 
 	// Left/Right leads when shown: the d-pad sits on the device's left side
 	if (is_cyclable)

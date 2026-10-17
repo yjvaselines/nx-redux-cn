@@ -1147,6 +1147,53 @@ static void check_idle_exit(void) {
 	}
 }
 
+static void check_auto_sleep(int64_t now) {
+	static int64_t accum_ms = 0;
+	static int64_t last_ms = 0;
+	static int64_t last_reload_ms = 0;
+	static int64_t not_playing_since_ms = 0;
+
+	/* 每 2 秒重读磁盘上的 auto_sleep_minutes，感知 UI 侧的修改 */
+	if (last_reload_ms == 0 || now - last_reload_ms >= 2000) {
+		Settings_reloadAutoSleep();
+		last_reload_ms = now;
+	}
+	if (last_ms == 0)
+		last_ms = now;
+
+	bool playing = false;
+	if (active_source == MUSIC_SOURCE_RADIO) {
+		RadioState rs = Radio_getState();
+		playing = (rs == RADIO_STATE_PLAYING || rs == RADIO_STATE_CONNECTING || rs == RADIO_STATE_BUFFERING);
+	} else if (active_source == MUSIC_SOURCE_LOCAL || active_source == MUSIC_SOURCE_PODCAST) {
+		PlayerSnapshot snapshot;
+		playing = (Player_getSnapshot(&snapshot) == 0 && snapshot.state == PLAYER_STATE_PLAYING);
+	}
+
+	int minutes = Settings_getAutoSleepMinutes();
+	if (!playing || minutes <= 0) {
+		last_ms = now;
+		/* 停止/暂停超过 15 秒才清零累计：切歌的短暂间隙不重置计时 */
+		if (!playing) {
+			if (not_playing_since_ms == 0)
+				not_playing_since_ms = now;
+			if (now - not_playing_since_ms >= 15000)
+				accum_ms = 0;
+		}
+		return;
+	}
+	not_playing_since_ms = 0;
+	accum_ms += now - last_ms;
+	last_ms = now;
+	if (accum_ms >= (int64_t)minutes * 60000) {
+		LOG_info("auto sleep timer reached (%d min), stopping playback\n", minutes);
+		accum_ms = 0;
+		stop_active_source();
+		/* 停止后不再有播放中的音频，UI/系统的休眠链恢复正常：
+		 * 熄屏超时与 PWR_sleep 按常规流程执行，daemon 正常响应 sleep */
+	}
+}
+
 static void service_tick(void) {
 	attempt_restore();
 	sync_music_volume();
@@ -1176,6 +1223,7 @@ static void service_tick(void) {
 		save_resume_state();
 		local_last_resume_ms = now;
 	}
+	check_auto_sleep(now);
 	if (!sleeping && active_source == MUSIC_SOURCE_PODCAST) {
 		PlayerSnapshot snapshot;
 		if (podcast_waiting_for_seek && !Player_resume()) {

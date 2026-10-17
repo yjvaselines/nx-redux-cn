@@ -35,6 +35,11 @@ static const int buffer_frames_values[] = {1024, 2048, 4096};
 #define RESAMPLER_QUALITY_COUNT 3 // 0=Fast, 1=Medium, 2=Best
 #define DEFAULT_RESAMPLER_QUALITY 0
 
+// 自动睡眠时间（分钟，0=关）
+static const int auto_sleep_values[] = {0, 10, 20, 30, 40, 50, 60};
+#define AUTO_SLEEP_VALUE_COUNT 7
+#define DEFAULT_AUTO_SLEEP_INDEX 0 // 关
+
 // Current settings
 static bool settings_owner_mode;
 
@@ -45,7 +50,17 @@ static struct {
 	int rate_mode_follow;	// 0=device default, 1=follow source
 	int resampler_quality;	// 0=Fast, 1=Medium, 2=Best
 	int buffer_frames;		// 1024, 2048, 4096
+	int auto_sleep_minutes; // 0=off, 10..60
 } current_settings;
+
+// Find index of current auto sleep value
+static int get_auto_sleep_index(void) {
+	for (int i = 0; i < AUTO_SLEEP_VALUE_COUNT; i++) {
+		if (auto_sleep_values[i] == current_settings.auto_sleep_minutes)
+			return i;
+	}
+	return DEFAULT_AUTO_SLEEP_INDEX;
+}
 
 // Find index of current bass filter value
 static int get_bass_filter_index(void) {
@@ -98,6 +113,7 @@ void Settings_init(void) {
 	current_settings.rate_mode_follow = 0;
 	current_settings.resampler_quality = DEFAULT_RESAMPLER_QUALITY;
 	current_settings.buffer_frames = buffer_frames_values[DEFAULT_BUFFER_FRAMES_INDEX];
+	current_settings.auto_sleep_minutes = auto_sleep_values[DEFAULT_AUTO_SLEEP_INDEX];
 
 	// Try to load from file
 	FILE* f = fopen(SETTINGS_FILE, "r");
@@ -139,6 +155,14 @@ void Settings_init(void) {
 				}
 			}
 		}
+		if (sscanf(line, "auto_sleep_minutes=%d", &value) == 1) {
+			for (int i = 0; i < AUTO_SLEEP_VALUE_COUNT; i++) {
+				if (auto_sleep_values[i] == value) {
+					current_settings.auto_sleep_minutes = value;
+					break;
+				}
+			}
+		}
 	}
 	fclose(f);
 }
@@ -165,12 +189,12 @@ void Settings_save(void) {
 		return;
 	}
 
-	char preserved[5][256] = {{0}};
+	char preserved[8][256] = {{0}};
 	int preserved_count = 0;
 	FILE* old = fopen(SETTINGS_FILE, "r");
 	char line[256];
 	if (old) {
-		while (preserved_count < 5 && fgets(line, sizeof(line), old)) {
+		while (preserved_count < 8 && fgets(line, sizeof(line), old)) {
 			bool other_owner = settings_owner_mode
 								   ? strncmp(line, "lyrics_enabled=", 15) == 0
 								   : strncmp(line, "bass_filter_hz=", 15) == 0 || strncmp(line, "soft_limiter=", 13) == 0 ||
@@ -200,6 +224,8 @@ void Settings_save(void) {
 			for (int i = 0; i < preserved_count; i++)
 				fputs(preserved[i], file);
 		}
+		// 自动睡眠时间为公共键：两种 owner 都写入，daemon 也会读取
+		fprintf(file, "auto_sleep_minutes=%d\n", current_settings.auto_sleep_minutes);
 		int ok = fflush(file) == 0 && fsync(temporary_fd) == 0;
 		if (fclose(file) != 0)
 			ok = 0;
@@ -374,4 +400,50 @@ const char* Settings_getBufferFramesDisplayStr(void) {
 	default:
 		return "2048";
 	}
+}
+
+// 自动睡眠时间 getters/cyclers
+int Settings_getAutoSleepMinutes(void) {
+	return current_settings.auto_sleep_minutes;
+}
+
+void Settings_cycleAutoSleepNext(void) {
+	int index = get_auto_sleep_index();
+	index = (index + 1) % AUTO_SLEEP_VALUE_COUNT;
+	current_settings.auto_sleep_minutes = auto_sleep_values[index];
+	Settings_save();
+}
+
+void Settings_cycleAutoSleepPrev(void) {
+	int index = get_auto_sleep_index();
+	index = (index - 1 + AUTO_SLEEP_VALUE_COUNT) % AUTO_SLEEP_VALUE_COUNT;
+	current_settings.auto_sleep_minutes = auto_sleep_values[index];
+	Settings_save();
+}
+
+const char* Settings_getAutoSleepDisplayStr(void) {
+	static char buf[16];
+	if (current_settings.auto_sleep_minutes == 0)
+		return "关";
+	snprintf(buf, sizeof(buf), "%d 分钟", current_settings.auto_sleep_minutes);
+	return buf;
+}
+
+void Settings_reloadAutoSleep(void) {
+	FILE* f = fopen(SETTINGS_FILE, "r");
+	if (!f)
+		return;
+	char line[256];
+	int value;
+	while (fgets(line, sizeof(line), f)) {
+		if (sscanf(line, "auto_sleep_minutes=%d", &value) == 1) {
+			for (int i = 0; i < AUTO_SLEEP_VALUE_COUNT; i++) {
+				if (auto_sleep_values[i] == value) {
+					current_settings.auto_sleep_minutes = value;
+					break;
+				}
+			}
+		}
+	}
+	fclose(f);
 }
