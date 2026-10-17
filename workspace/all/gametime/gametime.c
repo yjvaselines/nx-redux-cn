@@ -229,6 +229,21 @@ void freeRomImages() {
 	free(romImages);
 }
 
+// gametime 专用的中文时长格式（common 的 serializeTime 为共享函数，不动）
+static void serializeTimeCn(char* dest_str, int nTime) {
+	if (nTime >= 60) {
+		int h = nTime / 3600;
+		int m = (nTime - 3600 * h) / 60;
+		if (h > 0) {
+			sprintf(dest_str, "%d时%d分", h, m);
+		} else {
+			sprintf(dest_str, "%d分%d秒", m, nTime - 60 * m);
+		}
+	} else {
+		sprintf(dest_str, "%d秒", nTime);
+	}
+}
+
 void renderList(int count, int start, int end, int selected) {
 	char rom_name[255];
 	char total[25];
@@ -329,12 +344,12 @@ void renderList(int count, int start, int end, int selected) {
 			renderText(name_fit, nameFont, textColor, &(SDL_Rect){text_x, row_y + title_y, layout.list_display_size_x, textHeight});
 		}
 
-		serializeTime(total, entry->play_time_total);
-		serializeTime(average, entry->play_time_average);
+		serializeTimeCn(total, entry->play_time_total);
+		serializeTimeCn(average, entry->play_time_average);
 		snprintf(plays, sizeof(plays), "%d", entry->play_count);
 
 		// values first in the accent color, lowercase labels in muted gray
-		const char* details[] = {total, " total  ·  ", average, " avg  ·  ", plays, entry->play_count == 1 ? " play" : " plays"};
+		const char* details[] = {total, " 总游玩时长  ·  ", average, " 平均游玩时长  ·  ", plays, " 游玩次数"};
 		SDL_Rect detailsRect = {text_x, row_y + detail_y, layout.list_display_size_x, textHeight};
 		// accent only reads well on the selected white pill; use light gray on dark rows
 		SDL_Color valueCol = isSelected ? uintToColour(THEME_COLOR2_255) : COLOR_LIGHT_TEXT;
@@ -402,7 +417,7 @@ int main(int argc, char* argv[]) {
 	(void)argc;
 	(void)argv;
 	screen = GFX_init(MODE_MAIN);
-	UI_showSplashScreen(screen, "Game Time");
+	UI_showSplashScreen(screen, "游玩时长");
 
 	InitSettings();
 	PAD_init();
@@ -429,7 +444,7 @@ int main(int argc, char* argv[]) {
 		PAD_poll();
 		// MENU + SELECT exits (same combo as in-game and the other pak tools).
 		bool req_quit = false;
-		UI_handleQuitRequest(screen, &req_quit, &dirty, "Exit Game Tracker?", NULL);
+		UI_handleQuitRequest(screen, &req_quit, &dirty, "退出游玩时长？", NULL);
 		if (req_quit)
 			app_quit = true;
 
@@ -500,24 +515,24 @@ int main(int argc, char* argv[]) {
 			GFX_clear(screen);
 
 			if (count == 0) {
-				UI_renderMenuBar(screen, "Game Time");
-				UI_renderEmptyStateButtons(screen, "No play activity", "Play some games to track your time",
-										   (char*[]){"B", "EXIT", NULL}); // the tool's first level
+				UI_renderMenuBar(screen, "游玩时长");
+				UI_renderEmptyStateButtons(screen, "暂无游玩记录", "去玩几局游戏，记录你的游玩时长",
+										   (char*[]){"B", "退出", NULL}); // the tool's first level
 			} else {
 				char play_time_total_formatted[255];
-				serializeTime(play_time_total_formatted, play_activities->play_time_total);
+				serializeTimeCn(play_time_total_formatted, play_activities->play_time_total);
 				char title[256];
-				snprintf(title, sizeof(title), "Game Time: %s", play_time_total_formatted);
+				snprintf(title, sizeof(title), "游玩时长: %s", play_time_total_formatted);
 				UI_renderMenuBar(screen, title);
 
 				renderList(count, start, end, selected);
 
-				UI_renderButtonHintBar(screen, (char*[]){"B", "EXIT", "X", "DELETE", NULL});
+				UI_renderButtonHintBar(screen, (char*[]){"B", "退出", "X", "删除", NULL});
 
 				if (confirm_delete) {
 					char rom_name[255];
 					cleanName(rom_name, play_activities->play_activity[selected]->rom->name);
-					UI_renderConfirmDialog(screen, "Delete Record?", rom_name);
+					UI_renderConfirmDialog(screen, "删除记录？", rom_name);
 				}
 			}
 
