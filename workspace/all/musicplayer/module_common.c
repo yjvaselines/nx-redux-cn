@@ -239,6 +239,10 @@ void ModuleCommon_recordInputTime(void) {
 bool ModuleCommon_checkAutoScreenOffTimeout(void) {
 	if (module_screen_off)
 		return false;
+	// 任何按键都算活动：子页面（设置菜单等）不跑各自的熄屏计时，
+	// 返回上级页面时若停留期间已超时，这里按最后按键时间重新起算
+	if (PAD_anyPressed())
+		ModuleCommon_recordInputTime();
 	uint32_t screen_timeout_ms = Settings_getScreenOffTimeout() * 1000;
 	if (screen_timeout_ms > 0 && SDL_GetTicks() - last_input_time >= screen_timeout_ms) {
 		ModuleCommon_setScreenOff(true); // 直接熄屏，无提示页

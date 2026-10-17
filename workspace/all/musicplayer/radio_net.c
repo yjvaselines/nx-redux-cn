@@ -176,6 +176,10 @@ static int radio_net_fetch_internal(const char* url, uint8_t* buffer, int buffer
 		}
 		mbedtls_ssl_conf_authmode(&ssl_ctx->conf, MBEDTLS_SSL_VERIFY_NONE);
 		mbedtls_ssl_conf_rng(&ssl_ctx->conf, mbedtls_ctr_drbg_random, &ssl_ctx->ctr_drbg);
+		// 强制 TLS 1.2：部分 CDN（如 sk.cri.cn）对 TLS 1.3 ClientHello 回
+		// fatal alert（-0x7780），而 1.2 握手正常；GNU wget 验证服务器 1.2 可用。
+		mbedtls_ssl_conf_min_tls_version(&ssl_ctx->conf, MBEDTLS_SSL_VERSION_TLS1_2);
+		mbedtls_ssl_conf_max_tls_version(&ssl_ctx->conf, MBEDTLS_SSL_VERSION_TLS1_2);
 
 		ssl_ret = mbedtls_ssl_setup(&ssl_ctx->ssl, &ssl_ctx->conf);
 		if (ssl_ret != 0) {
@@ -737,6 +741,9 @@ int radio_net_resolve_url(const char* url, char* resolved_url, int resolved_url_
 			}
 			mbedtls_ssl_conf_authmode(&ssl_ctx->conf, MBEDTLS_SSL_VERIFY_NONE);
 			mbedtls_ssl_conf_rng(&ssl_ctx->conf, mbedtls_ctr_drbg_random, &ssl_ctx->ctr_drbg);
+			// 强制 TLS 1.2（同上：避开部分 CDN 对 1.3 ClientHello 的 fatal alert）
+			mbedtls_ssl_conf_min_tls_version(&ssl_ctx->conf, MBEDTLS_SSL_VERSION_TLS1_2);
+			mbedtls_ssl_conf_max_tls_version(&ssl_ctx->conf, MBEDTLS_SSL_VERSION_TLS1_2);
 			mbedtls_ssl_set_hostname(&ssl_ctx->ssl, host);
 
 			char port_str[16];

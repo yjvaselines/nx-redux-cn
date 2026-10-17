@@ -135,15 +135,15 @@ const char* Resume_getLabel(void) {
 	if (state.type == RESUME_TYPE_NONE)
 		return NULL;
 	if (state.source == RESUME_SOURCE_RADIO)
-		snprintf(label_buf, sizeof(label_buf), "Resume: Radio");
+		snprintf(label_buf, sizeof(label_buf), "继续播放：电台");
 	else if (state.source == RESUME_SOURCE_PODCAST)
-		snprintf(label_buf, sizeof(label_buf), "Resume: %s",
+		snprintf(label_buf, sizeof(label_buf), "继续播放：%s",
 				 state.track_name[0] ? state.track_name : state.podcast_episode_guid);
 	else if (state.track_name[0])
-		snprintf(label_buf, sizeof(label_buf), "Resume: %s", state.track_name);
+		snprintf(label_buf, sizeof(label_buf), "继续播放：%s", state.track_name);
 	else {
 		const char* slash = strrchr(state.track_path, '/');
-		snprintf(label_buf, sizeof(label_buf), "Resume: %s", slash ? slash + 1 : state.track_path);
+		snprintf(label_buf, sizeof(label_buf), "继续播放：%s", slash ? slash + 1 : state.track_path);
 	}
 	return label_buf;
 }
