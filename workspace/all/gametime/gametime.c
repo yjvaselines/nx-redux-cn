@@ -349,7 +349,7 @@ void renderList(int count, int start, int end, int selected) {
 		snprintf(plays, sizeof(plays), "%d", entry->play_count);
 
 		// values first in the accent color, lowercase labels in muted gray
-		const char* details[] = {total, " 总游玩时长  ·  ", average, " 平均游玩时长  ·  ", plays, " 游玩次数"};
+		const char* details[] = {total, " 总时长  ·  ", average, " 平均时长  ·  ", plays, " 次数"};
 		SDL_Rect detailsRect = {text_x, row_y + detail_y, layout.list_display_size_x, textHeight};
 		// accent only reads well on the selected white pill; use light gray on dark rows
 		SDL_Color valueCol = isSelected ? uintToColour(THEME_COLOR2_255) : COLOR_LIGHT_TEXT;
