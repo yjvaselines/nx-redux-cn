@@ -356,6 +356,19 @@ static void clear_sleep_resume_intent(void) {
 	wake_failed = false;
 }
 
+/* 熄屏续播：判定是否有正在播放/连接中的音频流（系统睡眠广播 sleep 时忽略它，
+ * 背光灭不影响 daemon 的独立音频流；空闲时才走 enter_sleep 记录恢复状态） */
+static bool is_actively_playing(void) {
+	if (active_source == MUSIC_SOURCE_RADIO) {
+		RadioState st = Radio_getState();
+		return st == RADIO_STATE_CONNECTING || st == RADIO_STATE_BUFFERING || st == RADIO_STATE_PLAYING;
+	}
+	PlayerSnapshot snapshot;
+	if (Player_getSnapshot(&snapshot) != 0)
+		return false;
+	return snapshot.state == PLAYER_STATE_PLAYING;
+}
+
 static int enter_sleep(void) {
 	if (sleeping)
 		return MUSIC_STATUS_OK;
@@ -1046,7 +1059,9 @@ static void handle_command(uint16_t command, const unsigned char* payload, size_
 		}
 		break;
 	case MUSIC_CMD_SLEEP:
-		status = enter_sleep();
+		/* 熄屏续播：主界面/其他 app 的睡眠（PWR_enterSleep 广播 sleep）不得打断
+		 * 播放——正在播时忽略；空闲时才 enter_sleep 记录状态。 */
+		status = is_actively_playing() ? MUSIC_STATUS_OK : enter_sleep();
 		break;
 	case MUSIC_CMD_WAKE:
 		/* An explicit wake starts a fresh bounded routing wait after a prior
