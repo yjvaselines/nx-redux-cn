@@ -45,7 +45,7 @@ void UI_renderConfirmDialog(SDL_Surface* dst, const char* title,
 
 // Default button hints (file scope: a compound literal inside the function
 // would not outlive the block it is declared in).
-static char* confirm_default_hints[] = {"B", "CANCEL", "A", "CONFIRM", NULL};
+static char* confirm_default_hints[] = {"B", "取消", "A", "确认", NULL};
 
 void UI_renderConfirmDialogHints(SDL_Surface* dst, const char* title,
 								 const char* subtitle, char** hints) {
@@ -221,7 +221,7 @@ int UI_choiceModal(SDL_Surface* screen, const char* title, const char* subtitle,
 	UI_ChoiceModalCtx ctx = {
 		.title = title,
 		.subtitle = subtitle,
-		.buttons = {"B", "CANCEL", "X", "NO", "A", "YES", NULL},
+		.buttons = {"B", "取消", "X", "否", "A", "是", NULL},
 	};
 	UI_ModalOpts opts = {
 		.screen = screen,
