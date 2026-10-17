@@ -1,5 +1,6 @@
 #include "settings.h"
 #include "../common/defines.h"
+#include "../common/config.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -174,7 +175,14 @@ void Settings_quit(void) {
 }
 
 int Settings_getScreenOffTimeout(void) {
-	return current_settings.screen_off_timeout;
+	// 取 app 设置与系统全局设置的较小值：系统设了更短的熄屏超时（省电意图）时遵守系统
+	int app_timeout = current_settings.screen_off_timeout;
+	if (app_timeout == 0)
+		return 0; // app 内明确关闭自动熄屏
+	int global_timeout = (int)CFG_getScreenTimeoutSecs();
+	if (global_timeout > 0 && global_timeout < app_timeout)
+		return global_timeout;
+	return app_timeout;
 }
 
 void Settings_cycleScreenOffNext(void) {

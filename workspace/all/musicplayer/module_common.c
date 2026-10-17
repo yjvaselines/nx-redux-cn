@@ -281,11 +281,11 @@ DarkScreenAction ModuleCommon_handleDarkScreenInput(SDL_Surface* screen, bool* s
 	if (PAD_justReleased(BTN_POWER) && power_pressed_at) {
 		power_pressed_at = 0;
 		if (*screen_off) {
+			// 直接点亮屏幕恢复页面（不再走"提示→再次熄屏"）
 			*screen_off = false;
 			PLAT_enableBacklight(1);
-			GFX_clear(screen);
-			render_screen_off_hint(screen);
-			GFX_flip(screen);
+			ModuleCommon_recordInputTime();
+			return DARK_SCREEN_WAKE;
 		}
 		ModuleCommon_startScreenOffHint();
 		return DARK_SCREEN_NONE;

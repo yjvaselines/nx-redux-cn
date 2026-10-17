@@ -56,9 +56,27 @@ int MenuModule_run(SDL_Surface* screen) {
 		PAD_poll();
 
 		// Background playback (track advancement, progress save) is ticked
-		// centrally in ModuleCommon_PWR_update below.
+	// centrally in ModuleCommon_PWR_update below.
+	MusicClient_update();
+	ModuleCommon_setAutosleepDisabled(Background_isPlaying());
+
+	// 播放中的熄屏/提示：只处理唤醒输入（电源键亮屏、A 切歌），其余忽略
+	static bool screen_off = false;
+	if (Background_isPlaying() && (screen_off || ModuleCommon_isScreenOffHintActive())) {
+		DarkScreenAction action = ModuleCommon_handleDarkScreenInput(screen, &screen_off);
+		if (action == DARK_SCREEN_WAKE)
+			dirty = 1;
+		else if (action == DARK_SCREEN_TOGGLE)
+			MusicClient_toggle();
+		if (ModuleCommon_processScreenOffHintTimeout()) {
+			screen_off = true;
+			GFX_clear(screen);
+			GFX_flip(screen);
+		}
 		MusicClient_update();
-		ModuleCommon_setAutosleepDisabled(Background_isPlaying());
+		GFX_sync();
+		continue;
+	}
 
 		// Determine first item: Now Playing (if BG active) > Resume > none
 		int first_item_mode = MENU_FIRST_NONE;
@@ -128,6 +146,11 @@ int MenuModule_run(SDL_Surface* screen) {
 			break;
 		}
 		if (UI_listViewBusy(v))
+			dirty = 1;
+
+		// 播放中自动熄屏（无输入超时 → 熄屏提示 → 灭屏）
+		if (Background_isPlaying() && MusicClient_snapshot()->state == MUSIC_STATE_PLAYING &&
+			ModuleCommon_checkAutoScreenOffTimeout())
 			dirty = 1;
 
 		// Handle power management

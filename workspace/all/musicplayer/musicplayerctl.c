@@ -16,6 +16,7 @@ int main(int argc, char** argv) {
 		fprintf(stderr, "usage: musicplayerctl {snapshot|load PATH|radio URL|podcast FEED_URL EPISODE_GUID|select N|play|pause|stop|toggle|next|previous|seek MS|repeat 0|1|shuffle|volume 0-20|sleep|wake|shutdown}\n");
 		return 2;
 	}
+	int playing_query = 0;
 	uint16_t command = 0;
 	size_t payload_capacity = sizeof(MusicPodcastLoadRequest);
 	if (sizeof(MusicLoadRequest) > payload_capacity)
@@ -27,6 +28,11 @@ int main(int argc, char** argv) {
 	memset(payload, 0, sizeof(payload));
 	if (!strcmp(argv[1], "snapshot"))
 		command = MUSIC_CMD_SNAPSHOT;
+	else if (!strcmp(argv[1], "playing")) {
+		// 退出码查询：正在播放/连接中返回 0，否则 1（供睡眠链判断是否需要静音）
+		command = MUSIC_CMD_SNAPSHOT;
+		playing_query = 1;
+	}
 	else if (!strcmp(argv[1], "load") && argc == 3) {
 		command = MUSIC_CMD_LOAD;
 		strncpy(((MusicLoadRequest*)payload)->path, argv[2], MUSIC_SERVICE_MAX_PATH - 1);
@@ -88,8 +94,18 @@ int main(int argc, char** argv) {
 	int status = MusicService_request(fd, command, payload, payload_length, &response, 5000);
 	MusicService_disconnect(fd);
 	if (status < 0) {
+		if (playing_query)
+			return 1; // daemon 不在（未启动）＝无播放
 		fprintf(stderr, "%s\n", response.error[0] ? response.error : "request failed");
 		return 1;
+	}
+	if (playing_query) {
+		const MusicSnapshotWire* s = &response.snapshot;
+		int playing = s->state == MUSIC_STATE_PLAYING ||
+					  s->source_state == MUSIC_RADIO_CONNECTING ||
+					  s->source_state == MUSIC_RADIO_BUFFERING ||
+					  s->source_state == MUSIC_RADIO_PLAYING;
+		return playing ? 0 : 1;
 	}
 	print_snapshot(&response.snapshot);
 	return 0;

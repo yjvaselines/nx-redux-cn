@@ -4378,7 +4378,10 @@ static void PWR_enterSleep(void) {
 		}
 		PLAT_enableBacklight(0);
 	}
-	if (!GetHDMI())
+	// Sleep mute would also silence the music daemon's independent ALSA stream
+	// (it feeds the same hardware mixer), so skip it while background playback
+	// is active — the daemon keeps playing through the screen-off period.
+	if (system("musicplayerctl.elf playing >/dev/null 2>&1") != 0 && !GetHDMI())
 		SetRawVolume(MUTE_VOLUME_RAW);
 	system("killall -STOP keymon.elf");
 	system("killall -STOP audiomon.elf");
