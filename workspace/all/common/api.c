@@ -4225,6 +4225,12 @@ void PWR_update(bool* _dirty, IndicatorType* _show_setting, PWR_callback_t befor
 		last_input_at = now = SDL_GetTicks();
 		power_pressed_at = 0;
 		dirty = true;
+	} else if (power_pressed_at && !PAD_isPressed(BTN_POWER) && now < power_pressed_at + 1000) {
+		// The button was released before the power-off threshold and explicit
+		// sleep didn't consume it (can_sleep==0 callers — media apps playing
+		// audio — handle the tap themselves). Drop the timer or its stale
+		// press time would trip the power-off branch a second later.
+		power_pressed_at = 0;
 	}
 
 	bool was_dirty = dirty; // dirty list (not including settings/battery)

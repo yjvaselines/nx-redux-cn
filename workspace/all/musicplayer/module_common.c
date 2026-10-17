@@ -206,11 +206,17 @@ void ModuleCommon_ctxAdd_impl(ContextMenuItem* items, int* count, int cap, const
 void ModuleCommon_setAutosleepDisabled(bool disabled) {
 	if (disabled && !autosleep_disabled) {
 		PWR_disableAutosleep();
+		// Screen-off playback: a short power press must not deep-sleep the
+		// system (PWR_sleep pauses the daemon via musicplayerctl sleep) —
+		// ModuleCommon_PWR_update turns the tap into a screen-off hint whose
+		// expiry just kills the backlight while audio keeps playing.
+		PWR_disableSleep();
 		autosleep_disabled = true;
 	} else if (!disabled && autosleep_disabled) {
 		// Don't re-enable autosleep if background audio is still playing
 		if (!Background_isPlaying()) {
 			PWR_enableAutosleep();
+			PWR_enableSleep();
 			autosleep_disabled = false;
 		}
 	}
@@ -302,6 +308,7 @@ void ModuleCommon_quit(void) {
 	// Ensure autosleep is re-enabled
 	if (autosleep_disabled) {
 		PWR_enableAutosleep();
+		PWR_enableSleep();
 		autosleep_disabled = false;
 	}
 
@@ -330,6 +337,22 @@ void ModuleCommon_PWR_update(bool* dirty, IndicatorType* show_setting) {
 	PWR_update(&dirty_bool, &indicator, NULL, NULL);
 	*dirty = dirty_bool ? 1 : 0;
 	*show_setting = (int)indicator;
+
+	// While playback disables sleep (setAutosleepDisabled above), PWR_update
+	// no longer consumes the power button (can_sleep==0): turn its short press
+	// into the screen-off hint, whose expiry kills only the backlight and the
+	// audio keeps playing. A >=1s hold still powers off inside PWR_update.
+	static uint32_t screen_power_press_at = 0;
+	if (PAD_justPressed(BTN_POWER))
+		screen_power_press_at = SDL_GetTicks();
+	if (autosleep_disabled && PAD_justReleased(BTN_POWER) && screen_power_press_at) {
+		bool short_press = SDL_GetTicks() - screen_power_press_at < 1000;
+		screen_power_press_at = 0;
+		if (short_press) {
+			ModuleCommon_startScreenOffHint();
+			*dirty = 1;
+		}
+	}
 
 	// Redraw when the menu-bar wifi/bt status changes (the pages only render
 	// on input, so without this the wifi icon stays stale until a keypress)
